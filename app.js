@@ -5,6 +5,7 @@ const express = require('express');
 
 const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle';
 const OUTPUT_PATH = '/data/aircraft.json';
+const TEMP_OUTPUT_PATH = '/data/aircraft.json.tmp';
 const REFRESH_INTERVAL_MS = 2000; // Recalculate positions every 2 seconds for smooth map movement
 
 let satRecords = [];
@@ -99,7 +100,7 @@ function propagateGlobalSet() {
   const now = new Date();
   const future = new Date(now.getTime() + 1000); // 1-second lookahead for bearing/climb derivation
 
-  const currentEpoch = Math.floor(now.getTime() / 1000);
+  const nowUnix = now.getTime() / 1000; // Floating point epoch timestamp
   const gmstNow = satellite.gstime(now);
   const gmstFuture = satellite.gstime(future);
 
@@ -154,21 +155,24 @@ function propagateGlobalSet() {
         baro_rate: baroRate,
         category: "A5",        // Large heavy aircraft / Spacecraft category
         type: "SAT",
-        seen: 0.1,             // Signal freshness indicator (seconds)
-        seen_pos: 0.1,
+        seen: 0,               // Set to 0 so tar1090 sees this as an active live ping
+        seen_pos: 0,           // Prevents tar1090 from purging contacts after 60s
         messages: 500
       });
     }
   }
 
   const dump1090Payload = {
-    now: currentEpoch,
+    now: nowUnix,
     messages: aircraft.length,
     aircraft: aircraft
   };
 
+  // Atomic file write operation: write to temporary path then rename instantly
+  // Prevents tar1090 from reading an empty file while it is actively being written
   try {
-    fs.writeFileSync(OUTPUT_PATH, JSON.stringify(dump1090Payload));
+    fs.writeFileSync(TEMP_OUTPUT_PATH, JSON.stringify(dump1090Payload));
+    fs.renameSync(TEMP_OUTPUT_PATH, OUTPUT_PATH);
   } catch (err) {
     console.error('Error writing aircraft.json:', err.message);
   }
