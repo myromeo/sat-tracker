@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  sat-engine:
+    build: .
+    container_name: sat-global-engine
+    restart: unless-stopped
+    volumes:
+      - tar1090-data:/data
+      
+volumes:
+  tar1090-data:
