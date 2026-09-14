@@ -8,9 +8,8 @@ const CELESTRAK_URL = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${CELES
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
 
-// Absolute altitude boundaries in kilometers
+// Absolute altitude floor in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
-const MAX_PLAUSIBLE_ALT_KM = 100000;
 
 const SYNTHETIC_HEX_BASE = 0xF00000;
 const SYNTHETIC_HEX_SPAN = 0x0FFFFE;
@@ -112,13 +111,14 @@ function broadcastTCP() {
 
     const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
 
-    // Range-bound altitude guard: rejects negatives and extreme outliers
-    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM || geoNow.height > MAX_PLAUSIBLE_ALT_KM) {
+    // Altitude floor check: Drop anything invalid or below 100km
+    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) {
       continue;
     }
 
-    const altFeet = Math.round(geoNow.height * 3280.84);
-    if (!Number.isFinite(altFeet) || altFeet < 0) continue;
+    // Output raw rounded KM directly
+    const altKm = Math.round(geoNow.height);
+    if (!Number.isFinite(altKm) || altKm < MIN_PLAUSIBLE_ALT_KM) continue;
 
     const lat = satellite.degreesLat(geoNow.latitude);
     const lon = satellite.degreesLong(geoNow.longitude);
@@ -139,15 +139,16 @@ function broadcastTCP() {
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
       
       if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
-        const altFeetFuture = Math.round(geoFuture.height * 3280.84);
+        const altKmFuture = Math.round(geoFuture.height);
         const futLat = satellite.degreesLat(geoFuture.latitude);
         const futLon = satellite.degreesLong(geoFuture.longitude);
 
         if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
           track = calculateBearing(lat, lon, futLat, futLon);
-          let rawVRate = Math.round((altFeetFuture - altFeet) * 60);
+          // Vertical rate in km/min
+          let rawVRate = Math.round((altKmFuture - altKm) * 60);
 
-          // Freeze vRate near floor to prevent tar1090 dead-reckoning past zero
+          // Freeze vRate near floor to prevent dead-reckoning extrapolation
           if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
             vRate = 0;
           } else {
@@ -159,9 +160,9 @@ function broadcastTCP() {
 
     const hexId = sat.hexId;
 
-    // Construct SBS-1 Messages
+    // Construct SBS-1 Messages (altKm inserted into altitude field)
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
-    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFeet},,,${latStr},${lonStr},,,,,,,0\r\n`;
+    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altKm},,,${latStr},${lonStr},,,,,,,0\r\n`;
     
     let msg4 = '';
     if (track !== '' && vRate !== '') {
