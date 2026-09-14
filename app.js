@@ -13,7 +13,12 @@ let satRecords = [];
 async function updateTLEs() {
   try {
     console.log('Fetching active satellites from CelesTrak...');
-    const response = await axios.get(CELESTRAK_URL);
+    
+    const response = await axios.get(CELESTRAK_URL, {
+      headers: {
+        'User-Agent': 'SatTrackerDockerApp/1.0 (Contact: myromeo@github)'
+      }
+    });
     
     satRecords = response.data.map(sat => ({
       name: sat.OBJECT_NAME || 'SAT',
