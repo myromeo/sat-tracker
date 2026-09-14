@@ -79,13 +79,13 @@ async function updateTLEs() {
   }
 }
 
-
-
 // Process positions across the entire global set
+
 function propagateGlobalSet() {
   if (!satRecords.length) return;
 
   const now = new Date();
+  const currentEpoch = Math.floor(now.getTime() / 1000);
   const gmst = satellite.gstime(now);
   const aircraft = [];
 
@@ -98,7 +98,7 @@ function propagateGlobalSet() {
       
       const lat = satellite.degreesLat(positionGd.latitude);
       const lon = satellite.degreesLong(positionGd.longitude);
-      const altFeet = Math.round(positionGd.height * 3280.84); // km to feet
+      const altFeet = Math.round(positionGd.height * 3280.84);
 
       const hexId = `SAT${sat.noradId.toString(16).padStart(5, '0')}`.toUpperCase();
 
@@ -112,17 +112,20 @@ function propagateGlobalSet() {
         speed: 14000,
         category: "A5",
         type: "SAT",
-        seen: 0
+        seen: 0.1,        // Crucial: indicates a fresh signal in seconds
+        seen_pos: 0.1,    // Crucial: indicates fresh coordinates
+        messages: 100
       });
     }
   }
 
   const dump1090Payload = {
-    now: Math.floor(Date.now() / 1000),
+    now: currentEpoch,    // Crucial: forces tar1090 to update its internal clock
     messages: aircraft.length,
     aircraft: aircraft
   };
 
+  // Write directly to shared volume
   fs.writeFileSync(OUTPUT_PATH, JSON.stringify(dump1090Payload));
 }
 
