@@ -112,9 +112,10 @@ function broadcastTCP() {
 
     const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
 
-    // Primary Altitude Guard: Height must be valid AND above floor
-    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) continue;
-
+    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM || geoNow.height > 100000) {
+      continue;
+    }
+    
     const altFeet = Math.round(geoNow.height * 3280.84);
     if (isNaN(altFeet) || altFeet < 0) continue; // Final safety net against NaN or negative feet conversion
 
