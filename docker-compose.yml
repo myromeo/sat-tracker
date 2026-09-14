@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   sat-engine:
-    build: .
+    image: ghcr.io/myromeo/sat-tracker:latest
     container_name: sat-global-engine
     restart: unless-stopped
     volumes:
