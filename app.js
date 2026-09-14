@@ -2,7 +2,7 @@ const axios = require('axios');
 const satellite = require('satellite.js');
 const fs = require('fs');
 
-const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
+const CELESTRAK_URL = 'https://tle.ivanstanojevic.me/api/tle/active.tle';
 const OUTPUT_PATH = '/data/aircraft.json';
 const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s for global scale
 
