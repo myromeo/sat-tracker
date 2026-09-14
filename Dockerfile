@@ -9,4 +9,7 @@ RUN npm install --production
 
 COPY app.js .
 
+# Document the SBS TCP stream port
+EXPOSE 30003
+
 CMD ["node", "app.js"]
