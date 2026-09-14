@@ -2,7 +2,9 @@ const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const net = require('net');
 
-const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle';
+const CELESTRAK_GROUP = process.env.CELESTRAK_GROUP || 'stations';
+const CELESTRAK_URL = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${CELESTRAK_GROUP}&FORMAT=tle`;
+
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
 
