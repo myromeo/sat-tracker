@@ -130,3 +130,28 @@ function propagateGlobalSet() {
 updateTLEs();
 setInterval(updateTLEs, 6 * 60 * 60 * 1000); // Refetch CelesTrak every 6 hours
 setInterval(propagateGlobalSet, REFRESH_INTERVAL_MS);
+
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Enable CORS so external web applications can fetch the data
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
+
+// Direct JSON endpoint
+app.get('/aircraft.json', (req, res) => {
+  if (fs.existsSync(OUTPUT_PATH)) {
+    res.sendFile(OUTPUT_PATH);
+  } else {
+    res.status(503).json({ error: 'Satellite data initializing...' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Satellite data API listening externally on port ${PORT}`);
+});
+
