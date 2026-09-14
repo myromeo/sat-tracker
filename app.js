@@ -12,13 +12,19 @@ const net = require('net');
  * SCIENTIFIC:        space-weather, geodetic, engineering, education
  * MISCELLANEOUS:     military, radar, cubesat, molniya, x-comm, other-comm
  */
-const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stations,visual').split(',');
+const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stations,visual')
+  .split(',')
+  .map(g => g.trim());
 
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
 
 // Absolute altitude floor in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
+
+// SBS-1 protocol standard maximum altitude cap in feet
+const MAX_SBS_ALT_FT = 100000;
+const KM_TO_FEET = 3280.84;
 
 const SYNTHETIC_HEX_BASE = 0xF00000;
 const SYNTHETIC_HEX_SPAN = 0x0FFFFE;
@@ -52,7 +58,7 @@ function fetchWithCurl(url) {
 async function updateTLEs() {
   try {
     const fetchPromises = CELESTRAK_GROUPS.map(group => {
-      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group.trim()}&FORMAT=tle`;
+      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`;
       return fetchWithCurl(url).catch(err => {
         console.error(`Error fetching group ${group}:`, err.message);
         return '';
@@ -139,9 +145,9 @@ function broadcastTCP() {
       continue;
     }
 
-    // Output raw rounded KM directly
-    const altKm = Math.round(geoNow.height);
-    if (!Number.isFinite(altKm) || altKm < MIN_PLAUSIBLE_ALT_KM) continue;
+    // Convert altitude from KM to Feet and cap to MAX_SBS_ALT_FT
+    const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
+    const altFt = Math.min(rawAltFt, MAX_SBS_ALT_FT);
 
     const lat = satellite.degreesLat(geoNow.latitude);
     const lon = satellite.degreesLong(geoNow.longitude);
@@ -162,14 +168,14 @@ function broadcastTCP() {
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
       
       if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
-        const altKmFuture = Math.round(geoFuture.height);
+        const rawAltFtFuture = Math.round(geoFuture.height * KM_TO_FEET);
         const futLat = satellite.degreesLat(geoFuture.latitude);
         const futLon = satellite.degreesLong(geoFuture.longitude);
 
         if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
           track = calculateBearing(lat, lon, futLat, futLon);
-          // Vertical rate in km/min
-          let rawVRate = Math.round((altKmFuture - altKm) * 60);
+          // Vertical rate in ft/min
+          let rawVRate = Math.round((rawAltFtFuture - rawAltFt) * 60);
 
           // Freeze vRate near floor to prevent dead-reckoning extrapolation
           if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
@@ -183,9 +189,9 @@ function broadcastTCP() {
 
     const hexId = sat.hexId;
 
-    // Construct SBS-1 Messages (altKm inserted into altitude field)
+    // Construct SBS-1 Messages (altFt inserted into altitude field)
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
-    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altKm},,,${latStr},${lonStr},,,,,,,0\r\n`;
+    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,,0\r\n`;
     
     let msg4 = '';
     if (track !== '' && vRate !== '') {
