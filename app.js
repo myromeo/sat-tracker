@@ -9,6 +9,7 @@ const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s for global scale
 let satRecords = [];
 
 // Fetch full global active payload set
+
 async function updateTLEs() {
   try {
     console.log('Fetching active satellites from CelesTrak...');
@@ -17,7 +18,7 @@ async function updateTLEs() {
     satRecords = response.data.map(sat => ({
       name: sat.OBJECT_NAME || 'SAT',
       noradId: sat.NORAD_CAT_ID,
-      satrec: satellite.jsonToSatrec(sat)
+      satrec: satellite.ommToSatrec(sat) // Fixed: Changed jsonToSatrec to ommToSatrec
     })).filter(s => s.satrec);
 
     console.log(`Successfully loaded ${satRecords.length} global satellites.`);
@@ -25,6 +26,7 @@ async function updateTLEs() {
     console.error('Error fetching CelesTrak data:', err.message);
   }
 }
+
 
 // Process positions across the entire global set
 function propagateGlobalSet() {
