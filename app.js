@@ -8,6 +8,22 @@ const CELESTRAK_URL = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${CELES
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
 
+// Anything computed below this is treated as bad propagation (decayed/garbage
+// TLE), not a real position. Even the lowest crewed stations orbit at
+// several hundred km, so this is a safe floor for the "stations" group.
+const MIN_PLAUSIBLE_ALT_KM = 100;
+
+// ICAO Annex 10, Vol III, Appendix to Chapter 9: address blocks whose first
+// bits are 1011 / 1101 / 1111 are reserved for future use and are NOT
+// allocated to any State. 0xF00000-0xFFFFFE (bit pattern 1111) is therefore
+// guaranteed not to collide with a real, currently-assigned aircraft ICAO24
+// address. The old 0xA00000 base sat inside the real USA allocation block,
+// so synthetic satellite hex codes could (and did) coincide with genuine
+// registered aircraft, which is why tar1090 was picking up a real aircraft's
+// type/registration for a satellite track.
+const SYNTHETIC_HEX_BASE = 0xF00000;
+const SYNTHETIC_HEX_SPAN = 0x0FFFFE; // stay clear of the 0xFFFFFF all-call address
+
 let satRecords = [];
 const clients = new Set();
 
@@ -51,7 +67,11 @@ async function updateTLEs() {
             newSatRecords.push({
               name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
               noradId: satrec.satnum,
-              satrec: satrec
+              satrec: satrec,
+              // Fixed, non-ICAO-colliding hex derived once per satellite so it
+              // stays stable across TLE refreshes.
+              hexId: (SYNTHETIC_HEX_BASE + (satrec.satnum % SYNTHETIC_HEX_SPAN))
+                .toString(16).toUpperCase().padStart(6, '0')
             });
           }
         } catch (e) {}
@@ -91,41 +111,65 @@ function broadcastTCP() {
   const { dStr, tStr } = getSBSDateTime(now);
 
   for (let sat of satRecords) {
+    // satellite.js can still hand back a "successful" (non-false) position
+    // for TLEs that are long decayed or otherwise numerically broken - this
+    // is a known upstream gotcha, not something satrec.error always flags.
+    // Skip anything the propagator itself has already flagged.
+    if (sat.satrec.error !== 0) continue;
+
     const posVelNow = satellite.propagate(sat.satrec, now);
     const posVelFuture = satellite.propagate(sat.satrec, future);
 
-    if (posVelNow.position && posVelNow.velocity) {
-      const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
+    if (!posVelNow.position || !posVelNow.velocity) continue;
+
+    const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
+
+    // This is the actual fix for the negative-altitude reports: a garbage
+    // propagation can produce a "valid-looking" but nonsensical (including
+    // negative) height even though position/velocity weren't false. Any
+    // object in the "stations" group genuinely sitting below ~100km isn't a
+    // real reading, so drop the sample rather than broadcast it.
+    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) continue;
+
+    const lat = satellite.degreesLat(geoNow.latitude).toFixed(4);
+    const lon = satellite.degreesLong(geoNow.longitude).toFixed(4);
+    const altFeet = Math.round(geoNow.height * 3280.84);
+
+    const { x, y, z } = posVelNow.velocity;
+    const speedKnots = Math.round(Math.sqrt(x * x + y * y + z * z) * 1943.84);
+
+    // Velocity/track/vertical-rate depend on the future sample too - guard
+    // it separately so one bad lookahead point doesn't poison this cycle or
+    // throw (posVelFuture.position can legitimately be false here even when
+    // posVelNow succeeded).
+    let track = '';
+    let vRate = '';
+    if (posVelFuture.position && posVelFuture.velocity) {
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
-      
-      const lat = satellite.degreesLat(geoNow.latitude).toFixed(4);
-      const lon = satellite.degreesLong(geoNow.longitude).toFixed(4);
-      const altFeet = Math.round(geoNow.height * 3280.84);
-      const altFeetFuture = Math.round(geoFuture.height * 3280.84);
+      if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
+        const altFeetFuture = Math.round(geoFuture.height * 3280.84);
+        track = calculateBearing(lat, lon, satellite.degreesLat(geoFuture.latitude), satellite.degreesLong(geoFuture.longitude));
+        vRate = Math.round((altFeetFuture - altFeet) * 60);
+      }
+    }
 
-      const { x, y, z } = posVelNow.velocity;
-      const speedKnots = Math.round(Math.sqrt(x*x + y*y + z*z) * 1943.84);
-      const track = calculateBearing(lat, lon, satellite.degreesLat(geoFuture.latitude), satellite.degreesLong(geoFuture.longitude));
-      const vRate = Math.round((altFeetFuture - altFeet) * 60);
-      
-      const hexId = (0xA00000 + (sat.noradId % 0x0FFFFF)).toString(16).toUpperCase().padStart(6, '0');
+    const hexId = sat.hexId;
 
-      // Construct SBS-1 Messages
-      // MSG 1: Identification (Callsign)
-      const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
-      // MSG 3: Position & Altitude
-      const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFeet},,,${lat},${lon},,,,,,,0\r\n`;
-      // MSG 4: Velocity (Speed, Track, Vert Rate)
-      const msg4 = `MSG,4,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,,${speedKnots},${track},,,${vRate},,,,,0\r\n`;
+    // Construct SBS-1 Messages
+    // MSG 1: Identification (Callsign)
+    const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
+    // MSG 3: Position & Altitude
+    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFeet},,,${lat},${lon},,,,,,,0\r\n`;
+    // MSG 4: Velocity (Speed, Track, Vert Rate)
+    const msg4 = `MSG,4,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,,${speedKnots},${track},,,${vRate},,,,,0\r\n`;
 
-      const payload = msg1 + msg3 + msg4;
+    const payload = msg1 + msg3 + msg4;
 
-      for (const client of clients) {
-        try {
-          client.write(payload);
-        } catch (err) {
-          clients.delete(client);
-        }
+    for (const client of clients) {
+      try {
+        client.write(payload);
+      } catch (err) {
+        clients.delete(client);
       }
     }
   }
