@@ -143,7 +143,7 @@ function propagateGlobalSet() {
 
       aircraft.push({
         hex: hexId,
-        type: "adsb_icao"
+        type: "adsb_icao",
         flight: sat.name.padEnd(8).substring(0, 8),
         desc: "SATELLITE",
         r: "SAT",
