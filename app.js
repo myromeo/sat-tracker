@@ -2,8 +2,17 @@ const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const net = require('net');
 
-const CELESTRAK_GROUP = process.env.CELESTRAK_GROUP || 'stations';
-const CELESTRAK_URL = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${CELESTRAK_GROUP}&FORMAT=tle`;
+/*
+ * Valid CelesTrak Group Names for CELESTRAK_GROUPS (comma-separated):
+ * 
+ * SPECIAL INTEREST:  stations, visual, active, analyst, 1999-025, last-30-days
+ * WEATHER & EARTH:   weather, noaa, goes, resource, sarsat, disaster, earthobs
+ * COMMUNICATIONS:    amateur, intelsat, ses, iridium, iridium-NEXT, orbcomm, globalstar, one-web, starlink
+ * NAVIGATION:        gps-ops, glo-ops, galileo, beidou, sbas, navic
+ * SCIENTIFIC:        space-weather, geodetic, engineering, education
+ * MISCELLANEOUS:     military, radar, cubesat, molniya, x-comm, other-comm
+ */
+const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stations,visual').split(',');
 
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
@@ -42,32 +51,46 @@ function fetchWithCurl(url) {
 
 async function updateTLEs() {
   try {
-    const rawData = await fetchWithCurl(CELESTRAK_URL);
-    if (rawData.includes('GP data has not updated')) return;
+    const fetchPromises = CELESTRAK_GROUPS.map(group => {
+      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group.trim()}&FORMAT=tle`;
+      return fetchWithCurl(url).catch(err => {
+        console.error(`Error fetching group ${group}:`, err.message);
+        return '';
+      });
+    });
 
-    const lines = rawData.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+    const results = await Promise.all(fetchPromises);
     const newSatRecords = [];
+    const seenNoradIds = new Set();
 
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].startsWith('1 ') && lines[i + 1]?.startsWith('2 ')) {
-        const name = (i > 0 && !lines[i - 1].startsWith('1 ')) ? lines[i - 1] : 'SAT';
-        try {
-          const satrec = satellite.twoline2satrec(lines[i], lines[i + 1]);
-          if (satrec && satrec.satnum) {
-            newSatRecords.push({
-              name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
-              noradId: satrec.satnum,
-              satrec: satrec,
-              hexId: (SYNTHETIC_HEX_BASE + (satrec.satnum % SYNTHETIC_HEX_SPAN))
-                .toString(16).toUpperCase().padStart(6, '0')
-            });
-          }
-        } catch (e) {}
+    for (const rawData of results) {
+      if (!rawData || rawData.includes('GP data has not updated')) continue;
+
+      const lines = rawData.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('1 ') && lines[i + 1]?.startsWith('2 ')) {
+          const name = (i > 0 && !lines[i - 1].startsWith('1 ')) ? lines[i - 1] : 'SAT';
+          try {
+            const satrec = satellite.twoline2satrec(lines[i], lines[i + 1]);
+            if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
+              seenNoradIds.add(satrec.satnum);
+              newSatRecords.push({
+                name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
+                noradId: satrec.satnum,
+                satrec: satrec,
+                hexId: (SYNTHETIC_HEX_BASE + (satrec.satnum % SYNTHETIC_HEX_SPAN))
+                  .toString(16).toUpperCase().padStart(6, '0')
+              });
+            }
+          } catch (e) {}
+        }
       }
     }
+
     if (newSatRecords.length > 0) {
       satRecords = newSatRecords;
-      console.log(`Loaded ${satRecords.length} satellites.`);
+      console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')}`);
     }
   } catch (err) {
     console.error('TLE fetch error:', err.message);
