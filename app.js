@@ -143,22 +143,33 @@ function propagateGlobalSet() {
 
       aircraft.push({
         hex: hexId,
+        type: "adsb_icao"
         flight: sat.name.padEnd(8).substring(0, 8),
+        desc: "SATELLITE",
+        r: "SAT",
+        t: "SAT",
         lat: Number(lat.toFixed(4)),
         lon: Number(lon.toFixed(4)),
-        altitude: altFeet,
         alt_baro: altFeet,
         alt_geom: altFeet,
+        altitude: altFeet,
         track: track,
+        track_rate: 0.00,
+        mag_heading: track,
+        true_heading: track,
         speed: speedKnots,
         gs: speedKnots,
         baro_rate: baroRate,
-        category: "A5",        // Large heavy aircraft / Spacecraft category
-        type: "SAT",
-        seen: 0,               // Set to 0 so tar1090 sees this as an active live ping
-        seen_pos: 0,           // Prevents tar1090 from purging contacts after 60s
+        geom_rate: baroRate,
+        category: "A5",
+        seen: 0.1,
+        seen_pos: 0.1,
+        rssi: -10.0,
+        mlat: [],
+        tisb: [],
         messages: 500
       });
+
     }
   }
 
@@ -181,7 +192,7 @@ function propagateGlobalSet() {
 // Initialization and Timers
 updateTLEs();
 setInterval(updateTLEs, 6 * 60 * 60 * 1000); // Fetch updated TLEs every 6 hours
-setInterval(propagateGlobalSet, REFRESH_INTERVAL_MS);
+setInterval(propagateGlobalSet, 2000);
 
 // Express HTTP API Server
 const app = express();
