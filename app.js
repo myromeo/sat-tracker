@@ -1,24 +1,32 @@
-const axios = require('axios');
+const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const fs = require('fs');
 
-const CELESTRAK_URL = 'https://tle.ivanstanojevic.me/api/tle/active.tle';
+const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
 const OUTPUT_PATH = '/data/aircraft.json';
-const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s for global scale
+const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s
 
 let satRecords = [];
 
+// Use native curl to bypass Cloudflare fingerprinting on the Pi
+function fetchWithCurl(url) {
+  return new Promise((resolve, reject) => {
+    const command = `curl -sL -A "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36" "${url}"`;
+    exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
+      if (error) {
+        return reject(error);
+      }
+      resolve(stdout);
+    });
+  });
+}
+
 async function updateTLEs() {
   try {
-    console.log('Fetching active satellites from CelesTrak...');
-    
-    const response = await axios.get(CELESTRAK_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
-    });
+    console.log('Fetching active satellites from CelesTrak via curl...');
+    const rawData = await fetchWithCurl(CELESTRAK_URL);
 
-    const lines = response.data.split('\n');
+    const lines = rawData.split(/\r?\n/);
     satRecords = [];
 
     for (let i = 0; i < lines.length - 2; i += 3) {
@@ -42,8 +50,6 @@ async function updateTLEs() {
   }
 }
 
-
-
 // Process positions across the entire global set
 function propagateGlobalSet() {
   if (!satRecords.length) return;
@@ -63,7 +69,6 @@ function propagateGlobalSet() {
       const lon = satellite.degreesLong(positionGd.longitude);
       const altFeet = Math.round(positionGd.height * 3280.84); // km to feet
 
-      // Synthetic hex identifier based on NORAD ID
       const hexId = `SAT${sat.noradId.toString(16).padStart(5, '0')}`.toUpperCase();
 
       aircraft.push({
@@ -73,7 +78,7 @@ function propagateGlobalSet() {
         lon: Number(lon.toFixed(4)),
         altitude: altFeet,
         track: 0,
-        speed: 14000, // Nominal orbital speed estimate in knots
+        speed: 14000,
         category: "A5",
         type: "SAT",
         seen: 0
@@ -87,7 +92,6 @@ function propagateGlobalSet() {
     aircraft: aircraft
   };
 
-  // Atomic write to volume
   fs.writeFileSync(OUTPUT_PATH, JSON.stringify(dump1090Payload));
 }
 
