@@ -1,15 +1,26 @@
 const { exec } = require('child_process');
 const satellite = require('satellite.js');
-const fs = require('fs');
-const express = require('express');
+const net = require('net');
 
 const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle';
-const OUTPUT_PATH = '/data/aircraft.json';
-const TEMP_OUTPUT_PATH = '/data/aircraft.json.tmp';
 const REFRESH_INTERVAL_MS = 2000;
+const TCP_PORT = 30003;
 
 let satRecords = [];
-let globalMessages = 0;
+const clients = new Set();
+
+// Start TCP Server
+const server = net.createServer((socket) => {
+  console.log(`Ultrafeeder connected from ${socket.remoteAddress}`);
+  clients.add(socket);
+
+  socket.on('end', () => clients.delete(socket));
+  socket.on('error', () => clients.delete(socket));
+});
+
+server.listen(TCP_PORT, () => {
+  console.log(`SBS/Basestation TCP Server listening on port ${TCP_PORT}`);
+});
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
@@ -36,16 +47,18 @@ async function updateTLEs() {
           const satrec = satellite.twoline2satrec(lines[i], lines[i + 1]);
           if (satrec && satrec.satnum) {
             newSatRecords.push({
-              name: name.replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 8).trim(),
+              name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
               noradId: satrec.satnum,
-              satrec: satrec,
-              messages: Math.floor(Math.random() * 100) // Initialize with a realistic baseline
+              satrec: satrec
             });
           }
         } catch (e) {}
       }
     }
-    if (newSatRecords.length > 0) satRecords = newSatRecords;
+    if (newSatRecords.length > 0) {
+      satRecords = newSatRecords;
+      console.log(`Loaded ${satRecords.length} satellites.`);
+    }
   } catch (err) {
     console.error('TLE fetch error:', err.message);
   }
@@ -59,14 +72,21 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
   return Math.round((Math.atan2(y, x) * 180 / Math.PI + 360) % 360);
 }
 
-function propagateGlobalSet() {
-  if (!satRecords.length) return;
+// Generate Basestation Date/Time format
+function getSBSDateTime(dateObj) {
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  const dStr = `${dateObj.getUTCFullYear()}/${pad(dateObj.getUTCMonth() + 1)}/${pad(dateObj.getUTCDate())}`;
+  const tStr = `${pad(dateObj.getUTCHours())}:${pad(dateObj.getUTCMinutes())}:${pad(dateObj.getUTCSeconds())}.${pad(dateObj.getUTCMilliseconds(), 3)}`;
+  return { dStr, tStr };
+}
+
+function broadcastTCP() {
+  if (!satRecords.length || clients.size === 0) return;
 
   const now = new Date();
   const future = new Date(now.getTime() + 1000);
-  const nowUnix = now.getTime() / 1000;
   const gmstNow = satellite.gstime(now), gmstFuture = satellite.gstime(future);
-  const aircraft = [];
+  const { dStr, tStr } = getSBSDateTime(now);
 
   for (let sat of satRecords) {
     const posVelNow = satellite.propagate(sat.satrec, now);
@@ -76,71 +96,39 @@ function propagateGlobalSet() {
       const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
       
-      const lat = satellite.degreesLat(geoNow.latitude);
-      const lon = satellite.degreesLong(geoNow.longitude);
+      const lat = satellite.degreesLat(geoNow.latitude).toFixed(4);
+      const lon = satellite.degreesLong(geoNow.longitude).toFixed(4);
       const altFeet = Math.round(geoNow.height * 3280.84);
       const altFeetFuture = Math.round(geoFuture.height * 3280.84);
 
       const { x, y, z } = posVelNow.velocity;
       const speedKnots = Math.round(Math.sqrt(x*x + y*y + z*z) * 1943.84);
       const track = calculateBearing(lat, lon, satellite.degreesLat(geoFuture.latitude), satellite.degreesLong(geoFuture.longitude));
-      const baroRate = Math.round((altFeetFuture - altFeet) * 60);
+      const vRate = Math.round((altFeetFuture - altFeet) * 60);
+      
       const hexId = (0xA00000 + (sat.noradId % 0x0FFFFF)).toString(16).toUpperCase().padStart(6, '0');
 
-      sat.messages += 1;
-      globalMessages += 1;
+      // Construct SBS-1 Messages
+      // MSG 1: Identification (Callsign)
+      const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
+      // MSG 3: Position & Altitude
+      const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFeet},,,${lat},${lon},,,,,,,0\r\n`;
+      // MSG 4: Velocity (Speed, Track, Vert Rate)
+      const msg4 = `MSG,4,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,,${speedKnots},${track},,,${vRate},,,,,0\r\n`;
 
-      aircraft.push({
-        hex: hexId,
-        type: "adsb_icao",
-        flight: sat.name,
-        desc: "SATELLITE",
-        r: "SAT",
-        t: "SAT",
-        lat: Number(lat.toFixed(4)),
-        lon: Number(lon.toFixed(4)),
-        altitude: altFeet,
-        alt_baro: altFeet,
-        alt_geom: altFeet,
-        track: track,
-        mag_heading: track,
-        true_heading: track,
-        speed: speedKnots,
-        gs: speedKnots,
-        baro_rate: baroRate,
-        geom_rate: baroRate,
-        category: "A5",
-        seen: 0,
-        seen_pos: 0,
-        messages: sat.messages,
-        nic: 8,          // Required to bypass tar1090 data-quality filters
-        rc: 186,
-        nac_p: 8,
-        nac_v: 1,
-        sil: 3,
-        sil_type: "perhour",
-        sda: 2
-      });
+      const payload = msg1 + msg3 + msg4;
+
+      for (const client of clients) {
+        try {
+          client.write(payload);
+        } catch (err) {
+          clients.delete(client);
+        }
+      }
     }
-  }
-
-  try {
-    fs.writeFileSync(TEMP_OUTPUT_PATH, JSON.stringify({ now: nowUnix, messages: globalMessages, aircraft: aircraft }));
-    fs.renameSync(TEMP_OUTPUT_PATH, OUTPUT_PATH);
-  } catch (err) {
-    console.error('File write error:', err.message);
   }
 }
 
 updateTLEs();
 setInterval(updateTLEs, 6 * 60 * 60 * 1000);
-setInterval(propagateGlobalSet, REFRESH_INTERVAL_MS);
-
-const app = express();
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  next();
-});
-app.get('/aircraft.json', (req, res) => fs.existsSync(OUTPUT_PATH) ? res.sendFile(OUTPUT_PATH) : res.status(503).json({ error: 'Initializing...' }));
-app.listen(process.env.PORT || 3000, () => console.log(`API active`));
+setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
