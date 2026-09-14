@@ -149,9 +149,13 @@ function broadcastTCP() {
       if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
         const altFeetFuture = Math.round(geoFuture.height * 3280.84);
         track = calculateBearing(lat, lon, satellite.degreesLat(geoFuture.latitude), satellite.degreesLong(geoFuture.longitude));
-        vRate = Math.round((altFeetFuture - altFeet) * 60);
+        
+        let rawVRate = Math.round((altFeetFuture - altFeet) * 60);
+        // Clamp vRate to ADS-B limits to prevent UI extrapolation into the ground
+        vRate = Math.max(-32640, Math.min(32640, rawVRate));
       }
     }
+
 
     const hexId = sat.hexId;
 
