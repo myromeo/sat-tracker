@@ -2,13 +2,11 @@ const axios = require('axios');
 const satellite = require('satellite.js');
 const fs = require('fs');
 
-const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json';
+const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
 const OUTPUT_PATH = '/data/aircraft.json';
 const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s for global scale
 
 let satRecords = [];
-
-// Fetch full global active payload set
 
 async function updateTLEs() {
   try {
@@ -16,21 +14,34 @@ async function updateTLEs() {
     
     const response = await axios.get(CELESTRAK_URL, {
       headers: {
-        'User-Agent': 'SatTrackerDockerApp/1.0 (Contact: myromeo@github)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
     });
-    
-    satRecords = response.data.map(sat => ({
-      name: sat.OBJECT_NAME || 'SAT',
-      noradId: sat.NORAD_CAT_ID,
-      satrec: satellite.ommToSatrec(sat) // Fixed: Changed jsonToSatrec to ommToSatrec
-    })).filter(s => s.satrec);
+
+    const lines = response.data.split('\n');
+    satRecords = [];
+
+    for (let i = 0; i < lines.length - 2; i += 3) {
+      const name = lines[i].trim();
+      const line1 = lines[i + 1].trim();
+      const line2 = lines[i + 2].trim();
+
+      if (line1.startsWith('1 ') && line2.startsWith('2 ')) {
+        const satrec = satellite.twoline2satrec(line1, line2);
+        satRecords.push({
+          name: name,
+          noradId: satrec.satnum,
+          satrec: satrec
+        });
+      }
+    }
 
     console.log(`Successfully loaded ${satRecords.length} global satellites.`);
   } catch (err) {
     console.error('Error fetching CelesTrak data:', err.message);
   }
 }
+
 
 
 // Process positions across the entire global set
