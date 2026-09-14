@@ -26,21 +26,39 @@ async function updateTLEs() {
     console.log('Fetching active satellites from CelesTrak via curl...');
     const rawData = await fetchWithCurl(CELESTRAK_URL);
 
-    const lines = rawData.split(/\r?\n/);
+    // Split by newlines and trim whitespace/carriage returns
+    const lines = rawData
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+
     satRecords = [];
 
-    for (let i = 0; i < lines.length - 2; i += 3) {
-      const name = lines[i].trim();
-      const line1 = lines[i + 1].trim();
-      const line2 = lines[i + 2].trim();
+    // Robust 3-line scanner
+    for (let i = 0; i < lines.length; i++) {
+      // Look for line 1 of a TLE pair
+      if (lines[i].startsWith('1 ') && (i + 1 < lines.length) && lines[i + 1].startsWith('2 ')) {
+        const line1 = lines[i];
+        const line2 = lines[i + 1];
+        
+        // Satellite name is usually the preceding line (if present and not another TLE line)
+        let name = 'SAT';
+        if (i > 0 && !lines[i - 1].startsWith('1 ') && !lines[i - 1].startsWith('2 ')) {
+          name = lines[i - 1];
+        }
 
-      if (line1.startsWith('1 ') && line2.startsWith('2 ')) {
-        const satrec = satellite.twoline2satrec(line1, line2);
-        satRecords.push({
-          name: name,
-          noradId: satrec.satnum,
-          satrec: satrec
-        });
+        try {
+          const satrec = satellite.twoline2satrec(line1, line2);
+          if (satrec && satrec.satnum) {
+            satRecords.push({
+              name: name,
+              noradId: satrec.satnum,
+              satrec: satrec
+            });
+          }
+        } catch (e) {
+          // Ignore invalid individual satellite TLE records
+        }
       }
     }
 
@@ -49,6 +67,7 @@ async function updateTLEs() {
     console.error('Error fetching CelesTrak data:', err.message);
   }
 }
+
 
 // Process positions across the entire global set
 function propagateGlobalSet() {
