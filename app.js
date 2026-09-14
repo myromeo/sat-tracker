@@ -8,8 +8,9 @@ const CELESTRAK_URL = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${CELES
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
 
-// Absolute minimum altitude floor (100km). Anything below this is discarded.
+// Absolute altitude boundaries in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
+const MAX_PLAUSIBLE_ALT_KM = 100000;
 
 const SYNTHETIC_HEX_BASE = 0xF00000;
 const SYNTHETIC_HEX_SPAN = 0x0FFFFE;
@@ -79,7 +80,6 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
   const radLat1 = lat1 * Math.PI / 180, radLat2 = lat2 * Math.PI / 180;
   let dLon = (lon2 - lon1) * Math.PI / 180;
   
-  // Normalize delta longitude across IDL (-180 to 180)
   if (dLon > Math.PI) dLon -= 2 * Math.PI;
   if (dLon < -Math.PI) dLon += 2 * Math.PI;
 
@@ -112,12 +112,13 @@ function broadcastTCP() {
 
     const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
 
-    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM || geoNow.height > 100000) {
+    // Range-bound altitude guard: rejects negatives and extreme outliers
+    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM || geoNow.height > MAX_PLAUSIBLE_ALT_KM) {
       continue;
     }
-    
+
     const altFeet = Math.round(geoNow.height * 3280.84);
-    if (isNaN(altFeet) || altFeet < 0) continue; // Final safety net against NaN or negative feet conversion
+    if (!Number.isFinite(altFeet) || altFeet < 0) continue;
 
     const lat = satellite.degreesLat(geoNow.latitude);
     const lon = satellite.degreesLong(geoNow.longitude);
@@ -136,6 +137,7 @@ function broadcastTCP() {
 
     if (posVelFuture.position && posVelFuture.velocity) {
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
+      
       if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
         const altFeetFuture = Math.round(geoFuture.height * 3280.84);
         const futLat = satellite.degreesLat(geoFuture.latitude);
@@ -144,7 +146,13 @@ function broadcastTCP() {
         if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
           track = calculateBearing(lat, lon, futLat, futLon);
           let rawVRate = Math.round((altFeetFuture - altFeet) * 60);
-          vRate = Math.max(-32640, Math.min(32640, rawVRate));
+
+          // Freeze vRate near floor to prevent tar1090 dead-reckoning past zero
+          if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
+            vRate = 0;
+          } else {
+            vRate = Math.max(-32640, Math.min(32640, rawVRate));
+          }
         }
       }
     }
@@ -155,7 +163,6 @@ function broadcastTCP() {
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
     const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFeet},,,${latStr},${lonStr},,,,,,,0\r\n`;
     
-    // Only construct MSG 4 if we actually have valid track and vRate
     let msg4 = '';
     if (track !== '' && vRate !== '') {
       msg4 = `MSG,4,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,,${speedKnots},${track},,,${vRate},,,,,0\r\n`;
@@ -163,7 +170,6 @@ function broadcastTCP() {
 
     const payload = msg1 + msg3 + msg4;
 
-    // Direct write with socket health validation
     for (const client of clients) {
       if (client.writable) {
         client.write(payload, (err) => {
