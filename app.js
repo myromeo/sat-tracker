@@ -2,7 +2,7 @@ const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const fs = require('fs');
 
-const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
+const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle';
 const OUTPUT_PATH = '/data/aircraft.json';
 const REFRESH_INTERVAL_MS = 5000; // Recalculate every 5s
 
@@ -26,22 +26,26 @@ async function updateTLEs() {
     console.log('Fetching active satellites from CelesTrak via curl...');
     const rawData = await fetchWithCurl(CELESTRAK_URL);
 
-    // Split by newlines and trim whitespace/carriage returns
+    // Check if CelesTrak returned a rate-limit notice instead of TLE data
+    if (rawData.includes('GP data has not updated since your last successful download')) {
+      console.warn('CelesTrak rate limit reached. Keeping existing satellite data in memory.');
+      return;
+    }
+
+    // Split by newlines and trim whitespace
     const lines = rawData
       .split(/\r?\n/)
       .map(line => line.trim())
       .filter(line => line.length > 0);
 
-    satRecords = [];
+    const newSatRecords = [];
 
     // Robust 3-line scanner
     for (let i = 0; i < lines.length; i++) {
-      // Look for line 1 of a TLE pair
       if (lines[i].startsWith('1 ') && (i + 1 < lines.length) && lines[i + 1].startsWith('2 ')) {
         const line1 = lines[i];
         const line2 = lines[i + 1];
         
-        // Satellite name is usually the preceding line (if present and not another TLE line)
         let name = 'SAT';
         if (i > 0 && !lines[i - 1].startsWith('1 ') && !lines[i - 1].startsWith('2 ')) {
           name = lines[i - 1];
@@ -50,23 +54,31 @@ async function updateTLEs() {
         try {
           const satrec = satellite.twoline2satrec(line1, line2);
           if (satrec && satrec.satnum) {
-            satRecords.push({
+            newSatRecords.push({
               name: name,
               noradId: satrec.satnum,
               satrec: satrec
             });
           }
         } catch (e) {
-          // Ignore invalid individual satellite TLE records
+          // Skip invalid individual records
         }
       }
     }
 
-    console.log(`Successfully loaded ${satRecords.length} global satellites.`);
+    // Only update memory if valid satellite data was parsed
+    if (newSatRecords.length > 0) {
+      satRecords = newSatRecords;
+      console.log(`Successfully loaded ${satRecords.length} global satellites.`);
+    } else {
+      console.warn('Received response, but no valid TLE records found. Retaining existing cache.');
+    }
+
   } catch (err) {
     console.error('Error fetching CelesTrak data:', err.message);
   }
 }
+
 
 
 // Process positions across the entire global set
