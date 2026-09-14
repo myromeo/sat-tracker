@@ -1,9 +1,14 @@
 {
-  "name": "sat-global-service",
+  "name": "sat-tracker",
   "version": "1.0.0",
+  "description": "Global 2D satellite tracking engine for tar1090",
   "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
   "dependencies": {
-    "axios": "^1.6.0",
+    "axios": "^1.6.8",
+    "express": "^4.19.2",
     "satellite.js": "^5.0.0"
   }
 }
