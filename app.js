@@ -6,9 +6,10 @@ const express = require('express');
 const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle';
 const OUTPUT_PATH = '/data/aircraft.json';
 const TEMP_OUTPUT_PATH = '/data/aircraft.json.tmp';
-const REFRESH_INTERVAL_MS = 2000; // Recalculate positions every 2 seconds for smooth map movement
+const REFRESH_INTERVAL_MS = 2000; // Recalculate positions every 2 seconds
 
 let satRecords = [];
+let globalMessageCounter = 1;
 
 // Use native curl to bypass Cloudflare fingerprinting on Linux/Raspberry Pi
 function fetchWithCurl(url) {
@@ -100,9 +101,11 @@ function propagateGlobalSet() {
   const now = new Date();
   const future = new Date(now.getTime() + 1000); // 1-second lookahead for bearing/climb derivation
 
-  const nowUnix = now.getTime() / 1000; // Floating point epoch timestamp
+  const nowUnix = now.getTime() / 1000;
   const gmstNow = satellite.gstime(now);
   const gmstFuture = satellite.gstime(future);
+
+  globalMessageCounter += 1; // Increment on every tick to force tar1090 map renders
 
   const aircraft = [];
 
@@ -150,9 +153,9 @@ function propagateGlobalSet() {
         t: "SAT",
         lat: Number(lat.toFixed(4)),
         lon: Number(lon.toFixed(4)),
+        altitude: altFeet,
         alt_baro: altFeet,
         alt_geom: altFeet,
-        altitude: altFeet,
         track: track,
         track_rate: 0.00,
         mag_heading: track,
@@ -162,25 +165,23 @@ function propagateGlobalSet() {
         baro_rate: baroRate,
         geom_rate: baroRate,
         category: "A5",
-        seen: 0.1,
-        seen_pos: 0.1,
+        seen: 0,
+        seen_pos: 0,
         rssi: -10.0,
         mlat: [],
         tisb: [],
-        messages: 500
+        messages: globalMessageCounter
       });
-
     }
   }
 
   const dump1090Payload = {
     now: nowUnix,
-    messages: aircraft.length,
+    messages: globalMessageCounter * aircraft.length,
     aircraft: aircraft
   };
 
-  // Atomic file write operation: write to temporary path then rename instantly
-  // Prevents tar1090 from reading an empty file while it is actively being written
+  // Atomic file write operation prevents tar1090 from reading incomplete files
   try {
     fs.writeFileSync(TEMP_OUTPUT_PATH, JSON.stringify(dump1090Payload));
     fs.renameSync(TEMP_OUTPUT_PATH, OUTPUT_PATH);
@@ -192,7 +193,7 @@ function propagateGlobalSet() {
 // Initialization and Timers
 updateTLEs();
 setInterval(updateTLEs, 6 * 60 * 60 * 1000); // Fetch updated TLEs every 6 hours
-setInterval(propagateGlobalSet, 2000);
+setInterval(propagateGlobalSet, REFRESH_INTERVAL_MS);
 
 // Express HTTP API Server
 const app = express();
