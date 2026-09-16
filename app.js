@@ -34,12 +34,13 @@ const KM_TO_FEET = 3280.84;
 // "which CelesTrak group did this come from", so the category is instead
 // encoded directly into the hex address. The F00000-FFFFFE block is already
 // reserved for satellites (see isSatelliteHex() client-side); this splits
-// that block into 8 sub-bands of 65536 addresses each, one per category:
+// that block into sub-bands of 65536 addresses each, one per category:
 //
 //   F0xxxx = stations     F4xxxx = navigation
 //   F1xxxx = visual       F5xxxx = comms
 //   F2xxxx = military     F6xxxx = science
-//   F3xxxx = weather      F7xxxx = other  (F8xxxx-FFxxxx reserved)
+//   F3xxxx = weather      F7xxxx = other
+//   F8xxxx = recent (last-30-days)   (F9xxxx-FFxxxx reserved)
 //
 // CATEGORY_BANDS below MUST be kept in sync with the identical table in the
 // client's markers.js (getSatelliteCategory / SAT_CATEGORIES) - the band
@@ -53,6 +54,7 @@ const CATEGORY_BANDS = {
   comms:      5,
   science:    6,
   other:      7,
+  recent:     8,
 };
 
 // Maps every documented CelesTrak group name to one of the categories above.
@@ -65,7 +67,7 @@ const GROUP_CATEGORY = {
   active: 'other',
   analyst: 'other',
   '1999-025': 'other',
-  'last-30-days': 'other',
+  'last-30-days': 'recent',
   // WEATHER & EARTH
   weather: 'weather',
   noaa: 'weather',
