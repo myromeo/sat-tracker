@@ -111,6 +111,21 @@ function categoryForGroup(group) {
   return GROUP_CATEGORY[group] || 'other';
 }
 
+// GROUP_CATEGORY above is deliberately kept complete against every group name
+// CelesTrak documents (see the header comment) - so if a configured group
+// isn't a key in it, that's essentially always a typo in CELESTRAK_GROUPS
+// (e.g. "last-30-day" instead of "last-30-days"), not a genuinely new/unlisted
+// CelesTrak group. Warn about it once at startup rather than silently and
+// invisibly dumping everything from that group into 'other' - a misspelled
+// group name also frequently means CelesTrak's API doesn't recognize it
+// either, so the group may load zero satellites, not just miscategorized ones.
+for (const group of CELESTRAK_GROUPS) {
+  if (!(group in GROUP_CATEGORY)) {
+    console.warn(`CELESTRAK_GROUPS: "${group}" is not a recognized CelesTrak group name - check for a typo. `
+      + `Known groups: ${Object.keys(GROUP_CATEGORY).join(', ')}`);
+  }
+}
+
 // Each category gets 65536 addresses (satnum wrapped into 16 bits); with
 // world catalog sizes in the tens of thousands this is enormously more
 // headroom than the old flat 0x0FFFFE-wide, cross-category modulus, so
