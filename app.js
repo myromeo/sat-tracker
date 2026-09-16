@@ -22,8 +22,10 @@ const TCP_PORT = 30003;
 // Absolute altitude floor in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
 
-// SBS-1 protocol standard maximum altitude cap in feet
-const MAX_SBS_ALT_FT = 100000;
+// SBS-1 protocol altitude field: just a plain integer, in feet, with no
+// protocol-level ceiling - real aircraft never approached one so nobody
+// bothered enforcing one. See the removed MAX_SBS_ALT_FT cap further down
+// for why satellites now report their true altitude instead.
 const KM_TO_FEET = 3280.84;
 
 // --- Category -> synthetic hex band ------------------------------------
@@ -245,9 +247,15 @@ function broadcastTCP() {
       continue;
     }
 
-    // Convert altitude from KM to Feet and cap to MAX_SBS_ALT_FT
+    // Altitude in feet, uncapped. The old MAX_SBS_ALT_FT=100000 cap made every
+    // satellite report an identical altitude regardless of true orbit (LEO,
+    // MEO and GEO objects were indistinguishable), which is worse than useless
+    // for a satellite - the whole point of the field, here, is to carry the
+    // real orbital altitude through to the client for km/mi display. SBS's
+    // altitude field is just an integer with no protocol-level ceiling, so an
+    // uncapped value passes through readsb the same way any other number does.
     const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
-    const altFt = Math.min(rawAltFt, MAX_SBS_ALT_FT);
+    const altFt = rawAltFt;
 
     const lat = satellite.degreesLat(geoNow.latitude);
     const lon = satellite.degreesLong(geoNow.longitude);
