@@ -9,6 +9,6 @@
   "dependencies": {
     "axios": "^1.6.8",
     "express": "^4.19.2",
-    "satellite.js": "^5.0.0"
+    "satellite.js": "^6.0.0"
   }
 }
