@@ -37,7 +37,7 @@ const KM_TO_FEET = 3280.84;
 //   F0xxxx = stations     F4xxxx = navigation
 //   F1xxxx = visual       F5xxxx = comms
 //   F2xxxx = military     F6xxxx = science
-//   F3xxxx = weather       F7xxxx = other  (F8xxxx-FFxxxx reserved)
+//   F3xxxx = weather      F7xxxx = other  (F8xxxx-FFxxxx reserved)
 //
 // CATEGORY_BANDS below MUST be kept in sync with the identical table in the
 // client's markers.js (getSatelliteCategory / SAT_CATEGORIES) - the band
