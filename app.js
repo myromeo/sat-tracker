@@ -167,7 +167,10 @@ function fetchWithCurl(url) {
 async function updateTLEs() {
   try {
     const fetchPromises = CELESTRAK_GROUPS.map(group => {
-      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`;
+      // FORMAT=json, not FORMAT=tle: see the comment block on updateTLEs()
+      // below for why - short version, legacy TLE text has a hard 5-digit
+      // catalog-number field and CelesTrak ran out of those in mid-2026.
+      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
       return fetchWithCurl(url).catch(err => {
         console.error(`Error fetching group ${group}:`, err.message);
         return '';
@@ -179,36 +182,60 @@ async function updateTLEs() {
     const seenNoradIds = new Set();
     const categoryCounts = {};
 
+    // Fetching OMM/JSON, not legacy TLE text. CelesTrak's own SATCAT ran out
+    // of 5-digit catalog numbers in mid-2026: every object catalogued since
+    // gets a 6-digit ID, and the legacy TLE text format has a HARD, fixed-
+    // width 5-character field for that number - there's no way to represent
+    // a 6-digit ID in it at all, not a bug on either end, just a 1960s-era
+    // format running out of room. CelesTrak's own guidance is explicit that
+    // "GP data will not be available [for those objects] using the TLE
+    // format" - which is exactly what "last-30-days returns no data" was:
+    // virtually every very recently launched object now has a 6-digit ID.
+    //
+    // satellite.js (current, shashwatak-maintained releases) added
+    // json2satrec() specifically for this: it builds a satrec straight from
+    // an OMM object's plain-number fields (NORAD_CAT_ID included), never
+    // touching the fixed-width TLE text format at all - so there is no
+    // digit-count ceiling here, full stop, for any group, not just this one.
+    // That's also why every group was switched, not just last-30-days: any
+    // group can eventually contain a newly-launched, high-catalog-number
+    // object, and this removes the limitation everywhere at once rather
+    // than treating it as a one-off special case.
     for (let g = 0; g < results.length; g++) {
       const rawData = results[g];
       const group = CELESTRAK_GROUPS[g];
       const category = categoryForGroup(group);
 
-      if (!rawData || rawData.includes('GP data has not updated')) continue;
+      if (!rawData) continue;
 
-      const lines = rawData.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+      let ommRecords;
+      try {
+        ommRecords = JSON.parse(rawData);
+      } catch (e) {
+        console.error(`Error parsing GP JSON for group ${group}:`, e.message);
+        continue;
+      }
+      if (!Array.isArray(ommRecords)) continue;
 
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith('1 ') && lines[i + 1]?.startsWith('2 ')) {
-          const name = (i > 0 && !lines[i - 1].startsWith('1 ')) ? lines[i - 1] : 'SAT';
-          try {
-            const satrec = satellite.twoline2satrec(lines[i], lines[i + 1]);
-            // If the same NORAD ID appears in more than one requested group
-            // (e.g. it's in both "stations" and "visual"), the group listed
-            // earliest in CELESTRAK_GROUPS wins the category assignment.
-            if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
-              seenNoradIds.add(satrec.satnum);
-              categoryCounts[category] = (categoryCounts[category] || 0) + 1;
-              newSatRecords.push({
-                name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
-                noradId: satrec.satnum,
-                satrec: satrec,
-                category: category,
-                hexId: buildHexId(category, satrec.satnum),
-              });
-            }
-          } catch (e) {}
-        }
+      for (const omm of ommRecords) {
+        try {
+          const satrec = satellite.json2satrec(omm);
+          // If the same NORAD ID appears in more than one requested group
+          // (e.g. it's in both "stations" and "visual"), the group listed
+          // earliest in CELESTRAK_GROUPS wins the category assignment.
+          if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
+            seenNoradIds.add(satrec.satnum);
+            categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+            const name = omm.OBJECT_NAME || 'SAT';
+            newSatRecords.push({
+              name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
+              noradId: satrec.satnum,
+              satrec: satrec,
+              category: category,
+              hexId: buildHexId(category, satrec.satnum),
+            });
+          }
+        } catch (e) {}
       }
     }
 
