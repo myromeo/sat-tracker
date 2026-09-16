@@ -247,15 +247,28 @@ function broadcastTCP() {
       continue;
     }
 
-    // Altitude in feet, uncapped. The old MAX_SBS_ALT_FT=100000 cap made every
-    // satellite report an identical altitude regardless of true orbit (LEO,
-    // MEO and GEO objects were indistinguishable), which is worse than useless
-    // for a satellite - the whole point of the field, here, is to carry the
-    // real orbital altitude through to the client for km/mi display. SBS's
-    // altitude field is just an integer with no protocol-level ceiling, so an
-    // uncapped value passes through readsb the same way any other number does.
+    // Altitude, transmitted as a SCALED-DOWN multiple of the true value, not
+    // the true value itself. Disabling binCraft (see early.js) should have
+    // been sufficient on its own - binCraft's alt_baro is a documented
+    // s16*25 field with a hard ceiling around 819,175ft - but if some other
+    // component in a pipeline we don't have source access to (readsb's own
+    // internal storage, some other narrow field, anything) still assumes
+    // aircraft-scale altitude, no amount of finding-and-disabling individual
+    // binary formats fixes a constraint we haven't found yet. Dividing by a
+    // large, fixed factor before transmission - and multiplying back on
+    // display, see formatSatelliteAltitude() in script.js - means every
+    // number this satellite ever puts on the wire looks, to every consumer
+    // in the pipeline, exactly like an unremarkable aircraft altitude (tens
+    // of thousands, the same magnitude the OLD 100,000ft-capped version
+    // always used safely) instead of a multi-million-foot outlier. That's
+    // safe against any fixed-width assumption, not just the one we found.
+    //
+    // SAT_ALT_SCALE MUST match the identical constant in script.js's
+    // formatSatelliteAltitude() exactly - this is the only thing making the
+    // transmitted number meaningful again on the other end.
+    const SAT_ALT_SCALE = 5000;
     const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
-    const altFt = rawAltFt;
+    const altFt = Math.round(rawAltFt / SAT_ALT_SCALE);
 
     const lat = satellite.degreesLat(geoNow.latitude);
     const lon = satellite.degreesLong(geoNow.longitude);
