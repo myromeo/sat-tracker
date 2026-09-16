@@ -329,7 +329,7 @@ function broadcastTCP() {
 
     // Construct SBS-1 Messages (altFt inserted into altitude field)
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
-    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,,0\r\n`;
+    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,0\r\n`;
     
     let msg4 = '';
     if (track !== '' && vRate !== '') {
