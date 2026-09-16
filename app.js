@@ -2,6 +2,25 @@ const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const net = require('net');
 
+// json2satrec() only exists in satellite.js releases from roughly late 2025
+// onward (it was added specifically to support OMM/JSON input alongside
+// legacy TLE). If the installed package predates that, this is undefined,
+// and EVERY satellite in EVERY group will fail to parse - which, without
+// this check, produces no error at all: the per-record try/catch below
+// swallows it silently, satRecords stays empty, and even the "Loaded N
+// satellites" log line never fires (it's gated on a non-empty result).
+// That combination - completely silent, no crash, nothing loads - is
+// exactly the failure mode this check exists to turn into a loud one.
+if (typeof satellite.json2satrec !== 'function') {
+  console.error(
+    'FATAL: satellite.json2satrec is not available in the installed satellite.js package. '
+    + 'This feeder requires a version that supports OMM/JSON input (added ~2025); the '
+    + 'legacy TLE-only versions do not have this function. Upgrade the satellite.js '
+    + 'dependency in this image and rebuild. Every satellite will silently fail to load '
+    + 'until this is fixed.'
+  );
+}
+
 /*
  * Valid CelesTrak Group Names for CELESTRAK_GROUPS (comma-separated):
  * 
@@ -217,6 +236,15 @@ async function updateTLEs() {
       }
       if (!Array.isArray(ommRecords)) continue;
 
+      // Logs the first parse failure per group, in full, rather than
+      // swallowing every one silently - a single bad record failing is
+      // normal and fine to skip quietly, but if EVERY record in a group
+      // fails (e.g. json2satrec missing, or a field-name mismatch), that's
+      // exactly the kind of thing the old empty `catch (e) {}` here made
+      // completely invisible. One clear line per group is enough to show
+      // the real problem without flooding the log for ~200 satellites.
+      let loggedParseErrorForGroup = false;
+
       for (const omm of ommRecords) {
         try {
           const satrec = satellite.json2satrec(omm);
@@ -235,7 +263,13 @@ async function updateTLEs() {
               hexId: buildHexId(category, satrec.satnum),
             });
           }
-        } catch (e) {}
+        } catch (e) {
+          if (!loggedParseErrorForGroup) {
+            loggedParseErrorForGroup = true;
+            console.error(`Error parsing GP record for group ${group} (object "${omm.OBJECT_NAME}", `
+              + `NORAD ${omm.NORAD_CAT_ID}):`, e.message);
+          }
+        }
       }
     }
 
