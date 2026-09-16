@@ -26,8 +26,98 @@ const MIN_PLAUSIBLE_ALT_KM = 100;
 const MAX_SBS_ALT_FT = 100000;
 const KM_TO_FEET = 3280.84;
 
-const SYNTHETIC_HEX_BASE = 0xF00000;
-const SYNTHETIC_HEX_SPAN = 0x0FFFFE;
+// --- Category -> synthetic hex band ------------------------------------
+//
+// The SBS/BaseStation protocol has no field to carry an arbitrary tag like
+// "which CelesTrak group did this come from", so the category is instead
+// encoded directly into the hex address. The F00000-FFFFFE block is already
+// reserved for satellites (see isSatelliteHex() client-side); this splits
+// that block into 8 sub-bands of 65536 addresses each, one per category:
+//
+//   F0xxxx = stations     F4xxxx = navigation
+//   F1xxxx = visual       F5xxxx = comms
+//   F2xxxx = military     F6xxxx = science
+//   F3xxxx = weather       F7xxxx = other  (F8xxxx-FFxxxx reserved)
+//
+// CATEGORY_BANDS below MUST be kept in sync with the identical table in the
+// client's markers.js (getSatelliteCategory / SAT_CATEGORIES) - the band
+// index is the only thing carrying this information across the wire.
+const CATEGORY_BANDS = {
+  stations:   0,
+  visual:     1,
+  military:   2,
+  weather:    3,
+  navigation: 4,
+  comms:      5,
+  science:    6,
+  other:      7,
+};
+
+// Maps every documented CelesTrak group name to one of the categories above.
+// Anything not listed here (a typo, or a future CelesTrak group) falls back
+// to 'other' rather than failing.
+const GROUP_CATEGORY = {
+  // SPECIAL INTEREST
+  stations: 'stations',
+  visual: 'visual',
+  active: 'other',
+  analyst: 'other',
+  '1999-025': 'other',
+  'last-30-days': 'other',
+  // WEATHER & EARTH
+  weather: 'weather',
+  noaa: 'weather',
+  goes: 'weather',
+  resource: 'weather',
+  sarsat: 'weather',
+  disaster: 'weather',
+  earthobs: 'weather',
+  // COMMUNICATIONS
+  amateur: 'comms',
+  intelsat: 'comms',
+  ses: 'comms',
+  iridium: 'comms',
+  'iridium-NEXT': 'comms',
+  orbcomm: 'comms',
+  globalstar: 'comms',
+  'one-web': 'comms',
+  starlink: 'comms',
+  // NAVIGATION
+  'gps-ops': 'navigation',
+  'glo-ops': 'navigation',
+  galileo: 'navigation',
+  beidou: 'navigation',
+  sbas: 'navigation',
+  navic: 'navigation',
+  // SCIENTIFIC
+  'space-weather': 'science',
+  geodetic: 'science',
+  engineering: 'science',
+  education: 'science',
+  // MISCELLANEOUS
+  military: 'military',
+  radar: 'other',
+  cubesat: 'other',
+  molniya: 'other',
+  'x-comm': 'other',
+  'other-comm': 'other',
+};
+
+function categoryForGroup(group) {
+  return GROUP_CATEGORY[group] || 'other';
+}
+
+// Each category gets 65536 addresses (satnum wrapped into 16 bits); with
+// world catalog sizes in the tens of thousands this is enormously more
+// headroom than the old flat 0x0FFFFE-wide, cross-category modulus, so
+// collisions between unrelated satellites are effectively eliminated too.
+const CATEGORY_SPAN = 0x10000;
+
+function buildHexId(category, noradId) {
+  const band = (0xF0 + (CATEGORY_BANDS[category] ?? CATEGORY_BANDS.other));
+  const low = noradId % CATEGORY_SPAN;
+  return (((band << 16) | low) >>> 0).toString(16).toUpperCase().padStart(6, '0');
+}
 
 let satRecords = [];
 const clients = new Set();
@@ -68,8 +158,13 @@ async function updateTLEs() {
     const results = await Promise.all(fetchPromises);
     const newSatRecords = [];
     const seenNoradIds = new Set();
+    const categoryCounts = {};
 
-    for (const rawData of results) {
+    for (let g = 0; g < results.length; g++) {
+      const rawData = results[g];
+      const group = CELESTRAK_GROUPS[g];
+      const category = categoryForGroup(group);
+
       if (!rawData || rawData.includes('GP data has not updated')) continue;
 
       const lines = rawData.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
@@ -79,14 +174,18 @@ async function updateTLEs() {
           const name = (i > 0 && !lines[i - 1].startsWith('1 ')) ? lines[i - 1] : 'SAT';
           try {
             const satrec = satellite.twoline2satrec(lines[i], lines[i + 1]);
+            // If the same NORAD ID appears in more than one requested group
+            // (e.g. it's in both "stations" and "visual"), the group listed
+            // earliest in CELESTRAK_GROUPS wins the category assignment.
             if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
               seenNoradIds.add(satrec.satnum);
+              categoryCounts[category] = (categoryCounts[category] || 0) + 1;
               newSatRecords.push({
                 name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
                 noradId: satrec.satnum,
                 satrec: satrec,
-                hexId: (SYNTHETIC_HEX_BASE + (satrec.satnum % SYNTHETIC_HEX_SPAN))
-                  .toString(16).toUpperCase().padStart(6, '0')
+                category: category,
+                hexId: buildHexId(category, satrec.satnum),
               });
             }
           } catch (e) {}
@@ -96,7 +195,8 @@ async function updateTLEs() {
 
     if (newSatRecords.length > 0) {
       satRecords = newSatRecords;
-      console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')}`);
+      const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
+      console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
     }
   } catch (err) {
     console.error('TLE fetch error:', err.message);
