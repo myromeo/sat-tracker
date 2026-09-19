@@ -1,12 +1,22 @@
-version: '3.8'
-
 services:
   sat-engine:
     image: ghcr.io/myromeo/sat-tracker:latest
     container_name: sat-global-engine
     restart: unless-stopped
+    ports:
+      - "30003:30003"
+    environment:
+      - CELESTRAK_GROUPS=last-30-days,stations,visual,military
+      - CACHE_DIR=/data
+      - TLE_REFRESH_HOURS=12
     volumes:
-      - tar1090-data:/data
-      
+      - sat_cache_data:/data
+    networks:
+      - nginxproxymanager_default
+
+networks:
+  nginxproxymanager_default:
+    external: true
+
 volumes:
-  tar1090-data:
+  sat_cache_data:
