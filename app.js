@@ -146,7 +146,11 @@ async function updateTLEs() {
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
       try {
         const response = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36' }
+          headers: {
+            // CelesTrak blocks generic User-Agents. Use a distinct app-identifying header:
+            'User-Agent': 'SatelliteSfeeder/1.0 (Node.js/tar1090-integration)',
+            'Accept': 'application/json, text/plain, */*'
+          }
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.text();
@@ -155,6 +159,7 @@ async function updateTLEs() {
         return '';
       }
     });
+
 
     const results = await Promise.all(fetchPromises);
     const newSatRecords = [];
