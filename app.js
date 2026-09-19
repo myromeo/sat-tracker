@@ -1,16 +1,14 @@
 const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const net = require('net');
+const fs = require('fs');
+const path = require('path');
 
-// json2satrec() only exists in satellite.js releases from roughly late 2025
-// onward (it was added specifically to support OMM/JSON input alongside
-// legacy TLE). If the installed package predates that, this is undefined,
-// and EVERY satellite in EVERY group will fail to parse - which, without
-// this check, produces no error at all: the per-record try/catch below
-// swallows it silently, satRecords stays empty, and even the "Loaded N
-// satellites" log line never fires (it's gated on a non-empty result).
-// That combination - completely silent, no crash, nothing loads - is
-// exactly the failure mode this check exists to turn into a loud one.
+// Cache configuration
+const CACHE_FILE = path.join(__dirname, 'sat_cache.json');
+const CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+// json2satrec() check
 if (typeof satellite.json2satrec !== 'function') {
   console.error(
     'FATAL: satellite.json2satrec is not available in the installed satellite.js package. '
@@ -21,49 +19,15 @@ if (typeof satellite.json2satrec !== 'function') {
   );
 }
 
-/*
- * Valid CelesTrak Group Names for CELESTRAK_GROUPS (comma-separated):
- * 
- * SPECIAL INTEREST:  stations, visual, active, analyst, 1999-025, last-30-days
- * WEATHER & EARTH:   weather, noaa, goes, resource, sarsat, disaster, earthobs
- * COMMUNICATIONS:    amateur, intelsat, ses, iridium, iridium-NEXT, orbcomm, globalstar, one-web, starlink
- * NAVIGATION:        gps-ops, glo-ops, galileo, beidou, sbas, navic
- * SCIENTIFIC:        space-weather, geodetic, engineering, education
- * MISCELLANEOUS:     military, radar, cubesat, molniya, x-comm, other-comm
- */
 const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stations,visual')
   .split(',')
   .map(g => g.trim());
 
 const REFRESH_INTERVAL_MS = 2000;
 const TCP_PORT = 30003;
-
-// Absolute altitude floor in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
-
-// SBS-1 protocol altitude field: just a plain integer, in feet, with no
-// protocol-level ceiling - real aircraft never approached one so nobody
-// bothered enforcing one. See the removed MAX_SBS_ALT_FT cap further down
-// for why satellites now report their true altitude instead.
 const KM_TO_FEET = 3280.84;
 
-// --- Category -> synthetic hex band ------------------------------------
-//
-// The SBS/BaseStation protocol has no field to carry an arbitrary tag like
-// "which CelesTrak group did this come from", so the category is instead
-// encoded directly into the hex address. The F00000-FFFFFE block is already
-// reserved for satellites (see isSatelliteHex() client-side); this splits
-// that block into sub-bands of 65536 addresses each, one per category:
-//
-//   F0xxxx = stations     F4xxxx = navigation
-//   F1xxxx = visual       F5xxxx = comms
-//   F2xxxx = military     F6xxxx = science
-//   F3xxxx = weather      F7xxxx = other
-//   F8xxxx = recent (last-30-days)   (F9xxxx-FFxxxx reserved)
-//
-// CATEGORY_BANDS below MUST be kept in sync with the identical table in the
-// client's markers.js (getSatelliteCategory / SAT_CATEGORIES) - the band
-// index is the only thing carrying this information across the wire.
 const CATEGORY_BANDS = {
   stations:   0,
   visual:     1,
@@ -76,18 +40,13 @@ const CATEGORY_BANDS = {
   recent:     8,
 };
 
-// Maps every documented CelesTrak group name to one of the categories above.
-// Anything not listed here (a typo, or a future CelesTrak group) falls back
-// to 'other' rather than failing.
 const GROUP_CATEGORY = {
-  // SPECIAL INTEREST
   stations: 'stations',
   visual: 'visual',
   active: 'other',
   analyst: 'other',
   '1999-025': 'other',
   'last-30-days': 'recent',
-  // WEATHER & EARTH
   weather: 'weather',
   noaa: 'weather',
   goes: 'weather',
@@ -95,7 +54,6 @@ const GROUP_CATEGORY = {
   sarsat: 'weather',
   disaster: 'weather',
   earthobs: 'weather',
-  // COMMUNICATIONS
   amateur: 'comms',
   intelsat: 'comms',
   ses: 'comms',
@@ -105,19 +63,16 @@ const GROUP_CATEGORY = {
   globalstar: 'comms',
   'one-web': 'comms',
   starlink: 'comms',
-  // NAVIGATION
   'gps-ops': 'navigation',
   'glo-ops': 'navigation',
   galileo: 'navigation',
   beidou: 'navigation',
   sbas: 'navigation',
   navic: 'navigation',
-  // SCIENTIFIC
   'space-weather': 'science',
   geodetic: 'science',
   engineering: 'science',
   education: 'science',
-  // MISCELLANEOUS
   military: 'military',
   radar: 'other',
   cubesat: 'other',
@@ -130,14 +85,6 @@ function categoryForGroup(group) {
   return GROUP_CATEGORY[group] || 'other';
 }
 
-// GROUP_CATEGORY above is deliberately kept complete against every group name
-// CelesTrak documents (see the header comment) - so if a configured group
-// isn't a key in it, that's essentially always a typo in CELESTRAK_GROUPS
-// (e.g. "last-30-day" instead of "last-30-days"), not a genuinely new/unlisted
-// CelesTrak group. Warn about it once at startup rather than silently and
-// invisibly dumping everything from that group into 'other' - a misspelled
-// group name also frequently means CelesTrak's API doesn't recognize it
-// either, so the group may load zero satellites, not just miscategorized ones.
 for (const group of CELESTRAK_GROUPS) {
   if (!(group in GROUP_CATEGORY)) {
     console.warn(`CELESTRAK_GROUPS: "${group}" is not a recognized CelesTrak group name - check for a typo. `
@@ -145,10 +92,6 @@ for (const group of CELESTRAK_GROUPS) {
   }
 }
 
-// Each category gets 65536 addresses (satnum wrapped into 16 bits); with
-// world catalog sizes in the tens of thousands this is enormously more
-// headroom than the old flat 0x0FFFFE-wide, cross-category modulus, so
-// collisions between unrelated satellites are effectively eliminated too.
 const CATEGORY_SPAN = 0x10000;
 
 function buildHexId(category, noradId) {
@@ -183,12 +126,140 @@ function fetchWithCurl(url) {
   });
 }
 
-async function updateTLEs() {
+// Process raw group JSON results into active satRecords
+function processOMMData(groupResults) {
+  const newSatRecords = [];
+  const seenNoradIds = new Set();
+  const categoryCounts = {};
+
+  for (let g = 0; g < groupResults.length; g++) {
+    const rawData = groupResults[g];
+    const group = CELESTRAK_GROUPS[g];
+    const category = categoryForGroup(group);
+
+    if (!rawData) continue;
+
+    let ommRecords;
+    try {
+      ommRecords = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    } catch (e) {
+      console.error(`Error parsing GP JSON for group ${group}:`, e.message);
+      continue;
+    }
+    if (!Array.isArray(ommRecords)) continue;
+
+    let loggedParseErrorForGroup = false;
+
+    for (const omm of ommRecords) {
+      try {
+        const satrec = satellite.json2satrec(omm);
+        if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
+          seenNoradIds.add(satrec.satnum);
+          categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+          const name = omm.OBJECT_NAME || 'SAT';
+          newSatRecords.push({
+            name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
+            noradId: satrec.satnum,
+            satrec: satrec,
+            category: category,
+            hexId: buildHexId(category, satrec.satnum),
+            ommData: omm // Preserved for disk cache writes
+          });
+        }
+      } catch (e) {
+        if (!loggedParseErrorForGroup) {
+          loggedParseErrorForGroup = true;
+          console.error(`Error parsing GP record for group ${group} (object "${omm.OBJECT_NAME}", `
+            + `NORAD ${omm.NORAD_CAT_ID}):`, e.message);
+        }
+      }
+    }
+  }
+
+  if (newSatRecords.length > 0) {
+    satRecords = newSatRecords;
+    const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
+    console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
+    return true;
+  }
+  return false;
+}
+
+// Loads local cache file if available
+function loadFromCache() {
+  if (!fs.existsSync(CACHE_FILE)) return false;
+
+  try {
+    const stats = fs.statSync(CACHE_FILE);
+    const ageMs = Date.now() - stats.mtimeMs;
+    const cacheData = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+
+    if (Array.isArray(cacheData) && cacheData.length > 0) {
+      const newSatRecords = [];
+      const seenNoradIds = new Set();
+      const categoryCounts = {};
+
+      for (const item of cacheData) {
+        if (!item.ommData) continue;
+        const satrec = satellite.json2satrec(item.ommData);
+        if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
+          seenNoradIds.add(satrec.satnum);
+          categoryCounts[item.category] = (categoryCounts[item.category] || 0) + 1;
+          newSatRecords.push({
+            name: item.name,
+            noradId: item.noradId,
+            satrec: satrec,
+            category: item.category,
+            hexId: item.hexId,
+            ommData: item.ommData
+          });
+        }
+      }
+
+      if (newSatRecords.length > 0) {
+        satRecords = newSatRecords;
+        const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
+        const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(1);
+        console.log(`Loaded ${satRecords.length} satellites from local disk cache (${ageHours}h old): ${summary}`);
+        return ageMs < CACHE_MAX_AGE_MS;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to read or parse local cache file:', err.message);
+  }
+  return false;
+}
+
+// Writes current satellite pool to disk
+function saveToCache() {
+  try {
+    const cachePayload = satRecords.map(s => ({
+      name: s.name,
+      noradId: s.noradId,
+      category: s.category,
+      hexId: s.hexId,
+      ommData: s.ommData
+    }));
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachePayload), 'utf8');
+    console.log(`Saved ${satRecords.length} satellite records to local cache (${CACHE_FILE})`);
+  } catch (err) {
+    console.error('Failed to write local cache file:', err.message);
+  }
+}
+
+async function updateTLEs(force = false) {
+  // Try disk cache first unless explicitly forcing a network update
+  if (!force) {
+    const isFresh = loadFromCache();
+    if (isFresh) {
+      console.log('Cache is under 12 hours old. Skipping network request to CelesTrak.');
+      return;
+    }
+  }
+
+  console.log('Fetching fresh satellite data from CelesTrak via curl...');
   try {
     const fetchPromises = CELESTRAK_GROUPS.map(group => {
-      // FORMAT=json, not FORMAT=tle: see the comment block on updateTLEs()
-      // below for why - short version, legacy TLE text has a hard 5-digit
-      // catalog-number field and CelesTrak ran out of those in mid-2026.
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
       return fetchWithCurl(url).catch(err => {
         console.error(`Error fetching group ${group}:`, err.message);
@@ -197,93 +268,20 @@ async function updateTLEs() {
     });
 
     const results = await Promise.all(fetchPromises);
-    const newSatRecords = [];
-    const seenNoradIds = new Set();
-    const categoryCounts = {};
+    const success = processOMMData(results);
 
-    // Fetching OMM/JSON, not legacy TLE text. CelesTrak's own SATCAT ran out
-    // of 5-digit catalog numbers in mid-2026: every object catalogued since
-    // gets a 6-digit ID, and the legacy TLE text format has a HARD, fixed-
-    // width 5-character field for that number - there's no way to represent
-    // a 6-digit ID in it at all, not a bug on either end, just a 1960s-era
-    // format running out of room. CelesTrak's own guidance is explicit that
-    // "GP data will not be available [for those objects] using the TLE
-    // format" - which is exactly what "last-30-days returns no data" was:
-    // virtually every very recently launched object now has a 6-digit ID.
-    //
-    // satellite.js (current, shashwatak-maintained releases) added
-    // json2satrec() specifically for this: it builds a satrec straight from
-    // an OMM object's plain-number fields (NORAD_CAT_ID included), never
-    // touching the fixed-width TLE text format at all - so there is no
-    // digit-count ceiling here, full stop, for any group, not just this one.
-    // That's also why every group was switched, not just last-30-days: any
-    // group can eventually contain a newly-launched, high-catalog-number
-    // object, and this removes the limitation everywhere at once rather
-    // than treating it as a one-off special case.
-    for (let g = 0; g < results.length; g++) {
-      const rawData = results[g];
-      const group = CELESTRAK_GROUPS[g];
-      const category = categoryForGroup(group);
-
-      if (!rawData) continue;
-
-      let ommRecords;
-      try {
-        ommRecords = JSON.parse(rawData);
-      } catch (e) {
-        console.error(`Error parsing GP JSON for group ${group}:`, e.message);
-        continue;
-      }
-      if (!Array.isArray(ommRecords)) continue;
-
-      // Logs the first parse failure per group, in full, rather than
-      // swallowing every one silently - a single bad record failing is
-      // normal and fine to skip quietly, but if EVERY record in a group
-      // fails (e.g. json2satrec missing, or a field-name mismatch), that's
-      // exactly the kind of thing the old empty `catch (e) {}` here made
-      // completely invisible. One clear line per group is enough to show
-      // the real problem without flooding the log for ~200 satellites.
-      let loggedParseErrorForGroup = false;
-
-      for (const omm of ommRecords) {
-        try {
-          const satrec = satellite.json2satrec(omm);
-          // If the same NORAD ID appears in more than one requested group
-          // (e.g. it's in both "stations" and "visual"), the group listed
-          // earliest in CELESTRAK_GROUPS wins the category assignment.
-          if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
-            seenNoradIds.add(satrec.satnum);
-            categoryCounts[category] = (categoryCounts[category] || 0) + 1;
-            const name = omm.OBJECT_NAME || 'SAT';
-            newSatRecords.push({
-              name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
-              noradId: satrec.satnum,
-              satrec: satrec,
-              category: category,
-              hexId: buildHexId(category, satrec.satnum),
-            });
-          }
-        } catch (e) {
-          if (!loggedParseErrorForGroup) {
-            loggedParseErrorForGroup = true;
-            console.error(`Error parsing GP record for group ${group} (object "${omm.OBJECT_NAME}", `
-              + `NORAD ${omm.NORAD_CAT_ID}):`, e.message);
-          }
-        }
-      }
-    }
-
-    if (newSatRecords.length > 0) {
-      satRecords = newSatRecords;
-      const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
-      console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
+    if (success) {
+      saveToCache();
+    } else {
+      console.warn('Network fetch returned no valid data. Falling back to local disk cache...');
+      loadFromCache();
     }
   } catch (err) {
     console.error('TLE fetch error:', err.message);
+    loadFromCache();
   }
 }
 
-// Fixed Bearing Calculation (Handles IDL Crossing)
 function calculateBearing(lat1, lon1, lat2, lon2) {
   const radLat1 = lat1 * Math.PI / 180, radLat2 = lat2 * Math.PI / 180;
   let dLon = (lon2 - lon1) * Math.PI / 180;
@@ -320,30 +318,10 @@ function broadcastTCP() {
 
     const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
 
-    // Altitude floor check: Drop anything invalid or below 100km
     if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) {
       continue;
     }
 
-    // Altitude, transmitted as a SCALED-DOWN multiple of the true value, not
-    // the true value itself. Disabling binCraft (see early.js) should have
-    // been sufficient on its own - binCraft's alt_baro is a documented
-    // s16*25 field with a hard ceiling around 819,175ft - but if some other
-    // component in a pipeline we don't have source access to (readsb's own
-    // internal storage, some other narrow field, anything) still assumes
-    // aircraft-scale altitude, no amount of finding-and-disabling individual
-    // binary formats fixes a constraint we haven't found yet. Dividing by a
-    // large, fixed factor before transmission - and multiplying back on
-    // display, see formatSatelliteAltitude() in script.js - means every
-    // number this satellite ever puts on the wire looks, to every consumer
-    // in the pipeline, exactly like an unremarkable aircraft altitude (tens
-    // of thousands, the same magnitude the OLD 100,000ft-capped version
-    // always used safely) instead of a multi-million-foot outlier. That's
-    // safe against any fixed-width assumption, not just the one we found.
-    //
-    // SAT_ALT_SCALE MUST match the identical constant in script.js's
-    // formatSatelliteAltitude() exactly - this is the only thing making the
-    // transmitted number meaningful again on the other end.
     const SAT_ALT_SCALE = 5000;
     const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
     const altFt = Math.round(rawAltFt / SAT_ALT_SCALE);
@@ -358,7 +336,6 @@ function broadcastTCP() {
     const { x, y, z } = posVelNow.velocity;
     const speedKnots = Math.round(Math.sqrt(x * x + y * y + z * z) * 1943.84);
 
-    // Lookahead calculation
     const posVelFuture = satellite.propagate(sat.satrec, future);
     let track = '';
     let vRate = '';
@@ -373,10 +350,8 @@ function broadcastTCP() {
 
         if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
           track = calculateBearing(lat, lon, futLat, futLon);
-          // Vertical rate in ft/min
           let rawVRate = Math.round((rawAltFtFuture - rawAltFt) * 60);
 
-          // Freeze vRate near floor to prevent dead-reckoning extrapolation
           if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
             vRate = 0;
           } else {
@@ -388,7 +363,6 @@ function broadcastTCP() {
 
     const hexId = sat.hexId;
 
-    // Construct SBS-1 Messages (altFt inserted into altitude field)
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
     const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,0\r\n`;
     
@@ -411,6 +385,9 @@ function broadcastTCP() {
   }
 }
 
+// Initial boot check (checks cache first)
 updateTLEs();
-setInterval(updateTLEs, 12 * 60 * 60 * 1000);
+
+// Re-check CelesTrak every 12 hours (forces network update)
+setInterval(() => updateTLEs(true), 12 * 60 * 60 * 1000);
 setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
