@@ -11,20 +11,6 @@ const DISABLED_FLAG_FILE = path.join(CACHE_DIR, 'NETWORKING_DISABLED.flag');
 const REFRESH_HOURS = parseFloat(process.env.TLE_REFRESH_HOURS) || 12;
 const CACHE_MAX_AGE_MS = REFRESH_HOURS * 60 * 60 * 1000;
 
-// This is the actual root cause of the original incident, not the null-pointer
-// crash itself: an uncaught exception inside a setInterval callback is fatal
-// to the whole Node process (this is standard Node behavior, not a bug in
-// this file specifically), Docker's `restart: unless-stopped` immediately
-// restarted the container, and every restart re-ran updateTLEs() from
-// scratch. The null-pointer bug that triggered THIS particular crash is now
-// fixed below (posVelNow/posVelFuture are checked before use), but the same
-// crash-restart-refetch mechanism would flood CelesTrak again just as
-// effectively from ANY other uncaught exception - a satellite-js edge case
-// we haven't hit yet, a malformed OMM record, anything. This handler is the
-// actual fix for the failure mode, not just the one bug that happened to
-// trigger it: it guarantees no future exception can crash the process at
-// all, logging it instead and letting the existing setInterval loops
-// continue on their normal schedule.
 process.on('uncaughtException', (err) => {
   console.error('[UNCAUGHT EXCEPTION - continuing, not crashing]', err);
 });
@@ -32,13 +18,6 @@ process.on('unhandledRejection', (err) => {
   console.error('[UNHANDLED REJECTION - continuing, not crashing]', err);
 });
 
-// Flag to permanently disable network fetching if CelesTrak returns non-200 HTTP codes.
-// Persisted to disk (not just an in-memory flag) specifically because CelesTrak's
-// own usage policy says to "cease all outward network queries immediately...
-// investigate human-side" - an in-memory-only flag forgets that instruction on
-// every container restart and would silently resume querying a service that
-// told this software to stop. It stays disabled until a human deletes the flag
-// file after actually investigating, exactly as requested.
 let networkingDisabled = fs.existsSync(DISABLED_FLAG_FILE);
 if (networkingDisabled) {
   console.error(`[CRITICAL CELESTRAK COMPLIANCE ALERT] ${DISABLED_FLAG_FILE} is present from a previous run - `
@@ -163,10 +142,7 @@ server.listen(TCP_PORT, () => {
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
-    // Removed -L to ensure 301 Redirects are actively caught per M2M compliance rules.
-    // A clean, non-browser-spoofed user agent that identifies this software plainly -
-    // claiming to be Mozilla while also being an automated M2M client is a combination
-    // abuse-detection systems commonly flag, the opposite of what we want here.
+    
     const command = `curl -s -w "\\n%{http_code}" -A "mlat.uk-SatelliteEngine/1.0 (+https://mlat.uk)" "${url}"`;
     exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout) => {
       if (error) return reject(error);
@@ -175,11 +151,6 @@ function fetchWithCurl(url) {
       const httpCode = parseInt(lines.pop(), 10);
       const responseBody = lines.join('\n');
 
-      // curl's %{http_code} reports "000" (parses to 0) when no HTTP response was
-      // received at all - DNS failure, connection refused, timeout. That's a local/
-      // network problem, not CelesTrak telling us anything, and must NOT trigger the
-      // permanent compliance shutdown below - only a genuine HTTP response in their
-      // documented problem range (301/403/404/50x, or any other non-200) means that.
       const gotRealHttpResponse = Number.isInteger(httpCode) && httpCode >= 100 && httpCode <= 599;
 
       if (!gotRealHttpResponse) {
@@ -339,8 +310,6 @@ async function updateTLEs() {
   try {
     const results = [];
     
-    // Sequential loop instead of Promise.all ensures we instantly halt on the very first HTTP error
-    // and don't simultaneously bombard the server with concurrent requests if it is already failing.
     for (const group of CELESTRAK_GROUPS) {
       if (networkingDisabled) break;
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
@@ -398,13 +367,7 @@ function broadcastTCP() {
   const { dStr, tStr } = getSBSDateTime(now);
 
   for (let sat of satRecords) {
-    // Defense in depth alongside the global uncaughtException handler above:
-    // this catches a bad satellite record HERE, immediately, and moves on to
-    // the next one in the same broadcast cycle - the other ~444 satellites
-    // keep updating on schedule instead of the whole cycle being skipped
-    // (which the global handler alone would still allow: it stops the
-    // process from dying, but a throw partway through this loop would still
-    // abandon every satellite after the one that failed, for this cycle).
+
     try {
     if (sat.satrec.error !== 0) continue;
 
@@ -484,7 +447,26 @@ function broadcastTCP() {
 }
 
 // Initial boot check
-updateTLEs();
+const STARTUP_RETRY_MS = 5 * 60 * 1000; // 5 minutes - short enough to recover quickly from a boot-time race, nowhere near frequent enough to trouble CelesTrak even if it took several attempts
+
+async function checkStartupSuccess() {
+  if (networkingDisabled) {
+    return; // hard stop, by design - no retry, human intervention required
+  }
+  if (satRecords.length > 0) {
+    console.log('Initial satellite load succeeded - startup retry loop no longer needed.');
+    return; // success - the 12-hour setInterval takes over from here, this never fires again
+  }
+  console.warn(`Initial satellite load has not yet succeeded - retrying in ${STARTUP_RETRY_MS / 60000} minutes.`);
+  setTimeout(async () => {
+    await updateTLEs();
+    checkStartupSuccess();
+  }, STARTUP_RETRY_MS);
+}
+(async () => {
+  await updateTLEs();
+  checkStartupSuccess();
+})();
 
 // Dynamic re-check interval based on TLE_REFRESH_HOURS
 setInterval(updateTLEs, CACHE_MAX_AGE_MS);
