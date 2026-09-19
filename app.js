@@ -121,7 +121,8 @@ server.listen(TCP_PORT, () => {
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
-    const command = `curl -sL -w "\\n%{http_code}" -A "Mozilla/5.0 (X11; Linux aarch64) SatelliteEngine/1.0" "${url}"`;
+    // Removed -L to ensure 301 Redirects are actively caught per M2M compliance rules
+    const command = `curl -s -w "\\n%{http_code}" -A "Mozilla/5.0 (X11; Linux aarch64) SatelliteEngine/1.0" "${url}"`;
     exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout) => {
       if (error) return reject(error);
 
@@ -280,19 +281,25 @@ async function updateTLEs() {
 
   console.log(`Cache missing or older than ${REFRESH_HOURS} hours. Requesting updates from CelesTrak...`);
   try {
-    const fetchPromises = CELESTRAK_GROUPS.map(group => {
+    const results = [];
+    
+    // Sequential loop instead of Promise.all ensures we instantly halt on the very first HTTP error
+    // and don't simultaneously bombard the server with concurrent requests if it is already failing.
+    for (const group of CELESTRAK_GROUPS) {
+      if (networkingDisabled) break;
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
-      return fetchWithCurl(url);
-    });
+      const data = await fetchWithCurl(url);
+      results.push(data);
+    }
 
-    const results = await Promise.all(fetchPromises);
-    const success = processOMMData(results);
-
-    if (success) {
-      saveToCache();
-    } else {
-      console.warn('Network response contained no valid satellite records. Reverting to cache fallback.');
-      loadFromCache();
+    if (!networkingDisabled) {
+      const success = processOMMData(results);
+      if (success) {
+        saveToCache();
+      } else {
+        console.warn('Network response contained no valid satellite records. Reverting to cache fallback.');
+        loadFromCache();
+      }
     }
   } catch (err) {
     if (err.isHttpError) {
