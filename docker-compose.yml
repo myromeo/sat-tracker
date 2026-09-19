@@ -3,8 +3,6 @@ services:
     image: ghcr.io/myromeo/sat-tracker:latest
     container_name: sat-global-engine
     restart: unless-stopped
-    ports:
-      - "30003:30003"
     environment:
       - CELESTRAK_GROUPS=last-30-days,stations,visual,military
       - CACHE_DIR=/data
