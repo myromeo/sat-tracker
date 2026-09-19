@@ -412,5 +412,5 @@ function broadcastTCP() {
 }
 
 updateTLEs();
-setInterval(updateTLEs, 6 * 60 * 60 * 1000);
+setInterval(updateTLEs, 12 * 60 * 60 * 1000);
 setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
