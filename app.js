@@ -4,18 +4,21 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 
-// Cache configuration
-const CACHE_FILE = path.join(__dirname, 'sat_cache.json');
-const CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+// Cache & Refresh Configuration
+const CACHE_DIR = process.env.CACHE_DIR || __dirname;
+const CACHE_FILE = path.join(CACHE_DIR, 'sat_cache.json');
+const REFRESH_HOURS = parseFloat(process.env.TLE_REFRESH_HOURS) || 12;
+const CACHE_MAX_AGE_MS = REFRESH_HOURS * 60 * 60 * 1000;
+
+// Flag to permanently disable network fetching if CelesTrak returns non-200 HTTP codes
+let networkingDisabled = false;
 
 // json2satrec() check
 if (typeof satellite.json2satrec !== 'function') {
   console.error(
     'FATAL: satellite.json2satrec is not available in the installed satellite.js package. '
-    + 'This feeder requires a version that supports OMM/JSON input (added ~2025); the '
-    + 'legacy TLE-only versions do not have this function. Upgrade the satellite.js '
-    + 'dependency in this image and rebuild. Every satellite will silently fail to load '
-    + 'until this is fixed.'
+    + 'This feeder requires a version that supports OMM/JSON input; the legacy TLE-only '
+    + 'versions do not have this function. Upgrade satellite.js in this image.'
   );
 }
 
@@ -23,7 +26,7 @@ const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stati
   .split(',')
   .map(g => g.trim());
 
-const REFRESH_INTERVAL_MS = 2000;
+const REFRESH_INTERVAL_MS = 2000; // SBS broadcast output interval
 const TCP_PORT = 30003;
 const MIN_PLAUSIBLE_ALT_KM = 100;
 const KM_TO_FEET = 3280.84;
@@ -87,7 +90,7 @@ function categoryForGroup(group) {
 
 for (const group of CELESTRAK_GROUPS) {
   if (!(group in GROUP_CATEGORY)) {
-    console.warn(`CELESTRAK_GROUPS: "${group}" is not a recognized CelesTrak group name - check for a typo. `
+    console.warn(`CELESTRAK_GROUPS: "${group}" is not a recognized CelesTrak group name. `
       + `Known groups: ${Object.keys(GROUP_CATEGORY).join(', ')}`);
   }
 }
@@ -118,15 +121,27 @@ server.listen(TCP_PORT, () => {
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
-    const command = `curl -sL -A "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36" "${url}"`;
+    const command = `curl -sL -w "\\n%{http_code}" -A "Mozilla/5.0 (X11; Linux aarch64) SatelliteEngine/1.0" "${url}"`;
     exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout) => {
       if (error) return reject(error);
-      resolve(stdout);
+
+      const lines = stdout.trim().split('\n');
+      const httpCode = parseInt(lines.pop(), 10);
+      const responseBody = lines.join('\n');
+
+      if (httpCode !== 200) {
+        return reject({
+          isHttpError: true,
+          status: httpCode,
+          message: `CelesTrak returned non-200 HTTP response code: [${httpCode}]. Querying stopped per compliance rules.`
+        });
+      }
+
+      resolve(responseBody);
     });
   });
 }
 
-// Process raw group JSON results into active satRecords
 function processOMMData(groupResults) {
   const newSatRecords = [];
   const seenNoradIds = new Set();
@@ -163,14 +178,13 @@ function processOMMData(groupResults) {
             satrec: satrec,
             category: category,
             hexId: buildHexId(category, satrec.satnum),
-            ommData: omm // Preserved for disk cache writes
+            ommData: omm
           });
         }
       } catch (e) {
         if (!loggedParseErrorForGroup) {
           loggedParseErrorForGroup = true;
-          console.error(`Error parsing GP record for group ${group} (object "${omm.OBJECT_NAME}", `
-            + `NORAD ${omm.NORAD_CAT_ID}):`, e.message);
+          console.error(`Error parsing GP record for group ${group}:`, e.message);
         }
       }
     }
@@ -185,7 +199,6 @@ function processOMMData(groupResults) {
   return false;
 }
 
-// Loads local cache file if available
 function loadFromCache() {
   if (!fs.existsSync(CACHE_FILE)) return false;
 
@@ -219,9 +232,15 @@ function loadFromCache() {
       if (newSatRecords.length > 0) {
         satRecords = newSatRecords;
         const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
-        const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(1);
-        console.log(`Loaded ${satRecords.length} satellites from local disk cache (${ageHours}h old): ${summary}`);
-        return ageMs < CACHE_MAX_AGE_MS;
+        const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(2);
+        
+        if (ageMs < CACHE_MAX_AGE_MS) {
+          console.log(`Cache valid (${ageHours}h old <= ${REFRESH_HOURS}h max). Loaded ${satRecords.length} satellites from disk: ${summary}`);
+          return true;
+        } else {
+          console.log(`Cache expired (${ageHours}h old > ${REFRESH_HOURS}h max). Data restored as fallback, network update needed.`);
+          return false;
+        }
       }
     }
   } catch (err) {
@@ -230,7 +249,6 @@ function loadFromCache() {
   return false;
 }
 
-// Writes current satellite pool to disk
 function saveToCache() {
   try {
     const cachePayload = satRecords.map(s => ({
@@ -247,24 +265,24 @@ function saveToCache() {
   }
 }
 
-async function updateTLEs(force = false) {
-  // Try disk cache first unless explicitly forcing a network update
-  if (!force) {
-    const isFresh = loadFromCache();
-    if (isFresh) {
-      console.log('Cache is under 12 hours old. Skipping network request to CelesTrak.');
-      return;
-    }
+async function updateTLEs() {
+  if (networkingDisabled) {
+    console.warn('Network requests disabled due to previous CelesTrak HTTP error. Operating purely from cache.');
+    loadFromCache();
+    return;
   }
 
-  console.log('Fetching fresh satellite data from CelesTrak via curl...');
+  const isCacheFresh = loadFromCache();
+  if (isCacheFresh) {
+    console.log(`Skipping CelesTrak fetch: cache is valid and under ${REFRESH_HOURS} hours old.`);
+    return;
+  }
+
+  console.log(`Cache missing or older than ${REFRESH_HOURS} hours. Requesting updates from CelesTrak...`);
   try {
     const fetchPromises = CELESTRAK_GROUPS.map(group => {
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
-      return fetchWithCurl(url).catch(err => {
-        console.error(`Error fetching group ${group}:`, err.message);
-        return '';
-      });
+      return fetchWithCurl(url);
     });
 
     const results = await Promise.all(fetchPromises);
@@ -273,11 +291,17 @@ async function updateTLEs(force = false) {
     if (success) {
       saveToCache();
     } else {
-      console.warn('Network fetch returned no valid data. Falling back to local disk cache...');
+      console.warn('Network response contained no valid satellite records. Reverting to cache fallback.');
       loadFromCache();
     }
   } catch (err) {
-    console.error('TLE fetch error:', err.message);
+    if (err.isHttpError) {
+      networkingDisabled = true;
+      console.error(`[CRITICAL CELESTRAK COMPLIANCE ALERT] ${err.message}`);
+      console.error('Ceasing all outward network queries immediately to avoid IP ban. Please investigate human-side.');
+    } else {
+      console.error('TLE fetch network error:', err.message);
+    }
     loadFromCache();
   }
 }
@@ -385,9 +409,11 @@ function broadcastTCP() {
   }
 }
 
-// Initial boot check (checks cache first)
+// Initial boot check
 updateTLEs();
 
-// Re-check CelesTrak every 12 hours (forces network update)
-setInterval(() => updateTLEs(true), 12 * 60 * 60 * 1000);
+// Dynamic re-check interval based on TLE_REFRESH_HOURS
+setInterval(updateTLEs, CACHE_MAX_AGE_MS);
+
+// Broadcast positions every 2 seconds
 setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
