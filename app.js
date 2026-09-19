@@ -1,16 +1,10 @@
-const { exec } = require('child_process');
 const satellite = require('satellite.js');
 const net = require('net');
 
 // json2satrec() only exists in satellite.js releases from roughly late 2025
 // onward (it was added specifically to support OMM/JSON input alongside
-// legacy TLE). If the installed package predates that, this is undefined,
-// and EVERY satellite in EVERY group will fail to parse - which, without
-// this check, produces no error at all: the per-record try/catch below
-// swallows it silently, satRecords stays empty, and even the "Loaded N
-// satellites" log line never fires (it's gated on a non-empty result).
-// That combination - completely silent, no crash, nothing loads - is
-// exactly the failure mode this check exists to turn into a loud one.
+// legacy TLE). If the installed package predates that, this is undefined.
+// Exit immediately rather than letting the script run in a broken state.
 if (typeof satellite.json2satrec !== 'function') {
   console.error(
     'FATAL: satellite.json2satrec is not available in the installed satellite.js package. '
@@ -19,6 +13,7 @@ if (typeof satellite.json2satrec !== 'function') {
     + 'dependency in this image and rebuild. Every satellite will silently fail to load '
     + 'until this is fixed.'
   );
+  process.exit(1);
 }
 
 /*
@@ -35,35 +30,19 @@ const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stati
   .split(',')
   .map(g => g.trim());
 
-const REFRESH_INTERVAL_MS = 2000;
+// Configurable broadcast interval in seconds via env var (defaults to 2s)
+const BROADCAST_INTERVAL_SEC = parseFloat(process.env.BROADCAST_INTERVAL_SEC || '2');
+const BROADCAST_INTERVAL_MS = Math.max(100, BROADCAST_INTERVAL_SEC * 1000);
+
 const TCP_PORT = 30003;
 
 // Absolute altitude floor in kilometers
 const MIN_PLAUSIBLE_ALT_KM = 100;
 
-// SBS-1 protocol altitude field: just a plain integer, in feet, with no
-// protocol-level ceiling - real aircraft never approached one so nobody
-// bothered enforcing one. See the removed MAX_SBS_ALT_FT cap further down
-// for why satellites now report their true altitude instead.
+// SBS-1 protocol altitude field conversion
 const KM_TO_FEET = 3280.84;
 
 // --- Category -> synthetic hex band ------------------------------------
-//
-// The SBS/BaseStation protocol has no field to carry an arbitrary tag like
-// "which CelesTrak group did this come from", so the category is instead
-// encoded directly into the hex address. The F00000-FFFFFE block is already
-// reserved for satellites (see isSatelliteHex() client-side); this splits
-// that block into sub-bands of 65536 addresses each, one per category:
-//
-//   F0xxxx = stations     F4xxxx = navigation
-//   F1xxxx = visual       F5xxxx = comms
-//   F2xxxx = military     F6xxxx = science
-//   F3xxxx = weather      F7xxxx = other
-//   F8xxxx = recent (last-30-days)   (F9xxxx-FFxxxx reserved)
-//
-// CATEGORY_BANDS below MUST be kept in sync with the identical table in the
-// client's markers.js (getSatelliteCategory / SAT_CATEGORIES) - the band
-// index is the only thing carrying this information across the wire.
 const CATEGORY_BANDS = {
   stations:   0,
   visual:     1,
@@ -77,8 +56,6 @@ const CATEGORY_BANDS = {
 };
 
 // Maps every documented CelesTrak group name to one of the categories above.
-// Anything not listed here (a typo, or a future CelesTrak group) falls back
-// to 'other' rather than failing.
 const GROUP_CATEGORY = {
   // SPECIAL INTEREST
   stations: 'stations',
@@ -130,14 +107,6 @@ function categoryForGroup(group) {
   return GROUP_CATEGORY[group] || 'other';
 }
 
-// GROUP_CATEGORY above is deliberately kept complete against every group name
-// CelesTrak documents (see the header comment) - so if a configured group
-// isn't a key in it, that's essentially always a typo in CELESTRAK_GROUPS
-// (e.g. "last-30-day" instead of "last-30-days"), not a genuinely new/unlisted
-// CelesTrak group. Warn about it once at startup rather than silently and
-// invisibly dumping everything from that group into 'other' - a misspelled
-// group name also frequently means CelesTrak's API doesn't recognize it
-// either, so the group may load zero satellites, not just miscategorized ones.
 for (const group of CELESTRAK_GROUPS) {
   if (!(group in GROUP_CATEGORY)) {
     console.warn(`CELESTRAK_GROUPS: "${group}" is not a recognized CelesTrak group name - check for a typo. `
@@ -145,15 +114,13 @@ for (const group of CELESTRAK_GROUPS) {
   }
 }
 
-// Each category gets 65536 addresses (satnum wrapped into 16 bits); with
-// world catalog sizes in the tens of thousands this is enormously more
-// headroom than the old flat 0x0FFFFE-wide, cross-category modulus, so
-// collisions between unrelated satellites are effectively eliminated too.
-const CATEGORY_SPAN = 0x10000;
-
+// 6-digit NORAD IDs support: uses low 16 bits for suffix and mixes high bits
+// into band mapping to avoid hex collisions for IDs > 65535.
 function buildHexId(category, noradId) {
-  const band = (0xF0 + (CATEGORY_BANDS[category] ?? CATEGORY_BANDS.other));
-  const low = noradId % CATEGORY_SPAN;
+  const baseBand = 0xF0 + (CATEGORY_BANDS[category] ?? CATEGORY_BANDS.other);
+  const overflow = Math.floor(noradId / 0x10000);
+  const band = (baseBand + overflow) & 0xFF;
+  const low = noradId % 0x10000;
   return (((band << 16) | low) >>> 0).toString(16).toUpperCase().padStart(6, '0');
 }
 
@@ -170,30 +137,23 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(TCP_PORT, () => {
-  console.log(`SBS/Basestation TCP Server listening on port ${TCP_PORT}`);
+  console.log(`SBS/Basestation TCP Server listening on port ${TCP_PORT} (broadcasting every ${BROADCAST_INTERVAL_SEC}s)`);
 });
-
-function fetchWithCurl(url) {
-  return new Promise((resolve, reject) => {
-    const command = `curl -sL -A "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36" "${url}"`;
-    exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout) => {
-      if (error) return reject(error);
-      resolve(stdout);
-    });
-  });
-}
 
 async function updateTLEs() {
   try {
-    const fetchPromises = CELESTRAK_GROUPS.map(group => {
-      // FORMAT=json, not FORMAT=tle: see the comment block on updateTLEs()
-      // below for why - short version, legacy TLE text has a hard 5-digit
-      // catalog-number field and CelesTrak ran out of those in mid-2026.
+    const fetchPromises = CELESTRAK_GROUPS.map(async (group) => {
       const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
-      return fetchWithCurl(url).catch(err => {
+      try {
+        const response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36' }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.text();
+      } catch (err) {
         console.error(`Error fetching group ${group}:`, err.message);
         return '';
-      });
+      }
     });
 
     const results = await Promise.all(fetchPromises);
@@ -201,25 +161,6 @@ async function updateTLEs() {
     const seenNoradIds = new Set();
     const categoryCounts = {};
 
-    // Fetching OMM/JSON, not legacy TLE text. CelesTrak's own SATCAT ran out
-    // of 5-digit catalog numbers in mid-2026: every object catalogued since
-    // gets a 6-digit ID, and the legacy TLE text format has a HARD, fixed-
-    // width 5-character field for that number - there's no way to represent
-    // a 6-digit ID in it at all, not a bug on either end, just a 1960s-era
-    // format running out of room. CelesTrak's own guidance is explicit that
-    // "GP data will not be available [for those objects] using the TLE
-    // format" - which is exactly what "last-30-days returns no data" was:
-    // virtually every very recently launched object now has a 6-digit ID.
-    //
-    // satellite.js (current, shashwatak-maintained releases) added
-    // json2satrec() specifically for this: it builds a satrec straight from
-    // an OMM object's plain-number fields (NORAD_CAT_ID included), never
-    // touching the fixed-width TLE text format at all - so there is no
-    // digit-count ceiling here, full stop, for any group, not just this one.
-    // That's also why every group was switched, not just last-30-days: any
-    // group can eventually contain a newly-launched, high-catalog-number
-    // object, and this removes the limitation everywhere at once rather
-    // than treating it as a one-off special case.
     for (let g = 0; g < results.length; g++) {
       const rawData = results[g];
       const group = CELESTRAK_GROUPS[g];
@@ -236,21 +177,11 @@ async function updateTLEs() {
       }
       if (!Array.isArray(ommRecords)) continue;
 
-      // Logs the first parse failure per group, in full, rather than
-      // swallowing every one silently - a single bad record failing is
-      // normal and fine to skip quietly, but if EVERY record in a group
-      // fails (e.g. json2satrec missing, or a field-name mismatch), that's
-      // exactly the kind of thing the old empty `catch (e) {}` here made
-      // completely invisible. One clear line per group is enough to show
-      // the real problem without flooding the log for ~200 satellites.
       let loggedParseErrorForGroup = false;
 
       for (const omm of ommRecords) {
         try {
           const satrec = satellite.json2satrec(omm);
-          // If the same NORAD ID appears in more than one requested group
-          // (e.g. it's in both "stations" and "visual"), the group listed
-          // earliest in CELESTRAK_GROUPS wins the category assignment.
           if (satrec && satrec.satnum && !seenNoradIds.has(satrec.satnum)) {
             seenNoradIds.add(satrec.satnum);
             categoryCounts[category] = (categoryCounts[category] || 0) + 1;
@@ -316,7 +247,7 @@ function broadcastTCP() {
     if (sat.satrec.error !== 0) continue;
 
     const posVelNow = satellite.propagate(sat.satrec, now);
-    if (!posVelNow.position || !posVelNow.velocity) continue;
+    if (!posVelNow || !posVelNow.position || !posVelNow.velocity) continue;
 
     const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
 
@@ -325,25 +256,6 @@ function broadcastTCP() {
       continue;
     }
 
-    // Altitude, transmitted as a SCALED-DOWN multiple of the true value, not
-    // the true value itself. Disabling binCraft (see early.js) should have
-    // been sufficient on its own - binCraft's alt_baro is a documented
-    // s16*25 field with a hard ceiling around 819,175ft - but if some other
-    // component in a pipeline we don't have source access to (readsb's own
-    // internal storage, some other narrow field, anything) still assumes
-    // aircraft-scale altitude, no amount of finding-and-disabling individual
-    // binary formats fixes a constraint we haven't found yet. Dividing by a
-    // large, fixed factor before transmission - and multiplying back on
-    // display, see formatSatelliteAltitude() in script.js - means every
-    // number this satellite ever puts on the wire looks, to every consumer
-    // in the pipeline, exactly like an unremarkable aircraft altitude (tens
-    // of thousands, the same magnitude the OLD 100,000ft-capped version
-    // always used safely) instead of a multi-million-foot outlier. That's
-    // safe against any fixed-width assumption, not just the one we found.
-    //
-    // SAT_ALT_SCALE MUST match the identical constant in script.js's
-    // formatSatelliteAltitude() exactly - this is the only thing making the
-    // transmitted number meaningful again on the other end.
     const SAT_ALT_SCALE = 5000;
     const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
     const altFt = Math.round(rawAltFt / SAT_ALT_SCALE);
@@ -363,7 +275,7 @@ function broadcastTCP() {
     let track = '';
     let vRate = '';
 
-    if (posVelFuture.position && posVelFuture.velocity) {
+    if (posVelFuture && posVelFuture.position && posVelFuture.velocity) {
       const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
       
       if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
@@ -373,10 +285,8 @@ function broadcastTCP() {
 
         if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
           track = calculateBearing(lat, lon, futLat, futLon);
-          // Vertical rate in ft/min
           let rawVRate = Math.round((rawAltFtFuture - rawAltFt) * 60);
 
-          // Freeze vRate near floor to prevent dead-reckoning extrapolation
           if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
             vRate = 0;
           } else {
@@ -388,7 +298,7 @@ function broadcastTCP() {
 
     const hexId = sat.hexId;
 
-    // Construct SBS-1 Messages (altFt inserted into altitude field)
+    // Construct SBS-1 Messages
     const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
     const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,0\r\n`;
     
@@ -413,4 +323,4 @@ function broadcastTCP() {
 
 updateTLEs();
 setInterval(updateTLEs, 6 * 60 * 60 * 1000);
-setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
+setInterval(broadcastTCP, BROADCAST_INTERVAL_MS);
