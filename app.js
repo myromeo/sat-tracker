@@ -537,8 +537,28 @@ const httpServer = http.createServer((req, res) => {
   res.end(latestPayload);
 });
 
-httpServer.listen(HTTP_PORT, () => {
-  console.log(`Satellite JSON endpoint listening on port ${HTTP_PORT} (GET / or /satellites.json)`);
+// Explicit 0.0.0.0 bind - deliberately NOT relying on Node's "no host given"
+// default. That default should mean "all interfaces", but in some minimal
+// container images/network configs it resolves to the IPv6 wildcard (::)
+// only, which can silently fail to accept IPv4 connections depending on the
+// container's network stack - exactly the symptom of "docker-compose port
+// mapping looks right, container isn't crashing, nothing ever answers".
+// A dedicated 'error' listener matters here too: without one, a failed
+// listen() throws as an EventEmitter 'error' with no handler, which becomes
+// an uncaught exception - and this file's global uncaughtException handler
+// (see the top of the file) would swallow that into one generic logged
+// line, making a completely dead HTTP server look identical to a healthy,
+// quiet one in the logs. This handler makes that failure loud and specific
+// instead.
+httpServer.on('error', (err) => {
+  console.error(`[SATELLITE HTTP SERVER FAILED TO START] Could not listen on 0.0.0.0:${HTTP_PORT}: ${err.code || err.message}. `
+    + `The satellite JSON endpoint is NOT available - nothing else in this process depends on it, so TLE fetching/caching continues normally, `
+    + `but no browser will ever get satellite data from this container until this is fixed. `
+    + (err.code === 'EADDRINUSE' ? 'Something else is already using this port inside the container.' : 'Check SATELLITE_HTTP_PORT and the container network configuration.'));
+});
+
+httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+  console.log(`Satellite JSON endpoint listening on 0.0.0.0:${HTTP_PORT} (GET / or /satellites.json)`);
 });
 
 // Initial boot check
