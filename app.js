@@ -1,6 +1,6 @@
 const { exec } = require('child_process');
 const satellite = require('satellite.js');
-const net = require('net');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -47,10 +47,15 @@ const CELESTRAK_GROUPS = (process.env.CELESTRAK_GROUPS || 'weather,gps-ops,stati
   .split(',')
   .map(g => g.trim());
 
-const REFRESH_INTERVAL_MS = 2000; // SBS broadcast output interval
-const TCP_PORT = 30003;
+const REFRESH_INTERVAL_MS = 2000; // how often satellite positions are recomputed
 const MIN_PLAUSIBLE_ALT_KM = 100;
 const KM_TO_FEET = 3280.84;
+
+// The port this container's JSON endpoint listens on. Set SATELLITE_HTTP_PORT
+// in docker-compose (or the environment) to whatever host port you map it to;
+// the frontend's "satellite URL" setting then just points at that port.
+const HTTP_PORT_ENV = parseInt(process.env.SATELLITE_HTTP_PORT, 10);
+const HTTP_PORT = Number.isFinite(HTTP_PORT_ENV) && HTTP_PORT_ENV >= 0 ? HTTP_PORT_ENV : 8978;
 
 const CATEGORY_BANDS = {
   stations:   0,
@@ -116,77 +121,13 @@ for (const group of CELESTRAK_GROUPS) {
   }
 }
 
-// CATEGORY_SPAN (65536) is all the room a fake ICAO hex has left for a NORAD
-// ID once a byte is spent on the "definitely not a real aircraft" marker
-// (0xF0-0xFF - a genuinely reserved/unallocated block in the real ICAO 24-bit
-// address space) plus the category nibble within it. That ceiling is now a
-// real, live problem: CelesTrak ran out of 5-digit catalog numbers on
-// 2026-07-11 (https://celestrak.org/satcat/satcat-format.php carries their
-// own banner about it) - every satellite launched since then, Starlink very
-// much included given how often it launches, gets a 6-digit NORAD ID
-// (100000+), which cannot fit in 16 bits no matter how it's packed.
-//
-// `noradId % CATEGORY_SPAN` used to be used here unconditionally, which is
-// silently WRONG for any such satellite: the wraparound can land on the
-// exact fake-hex value that a DIFFERENT, real, smaller NORAD ID also encodes
-// to - so the frontend confidently shows THAT satellite's owner, launch
-// date, etc. against this one. That's how a brand-new Starlink ended up
-// reading "Commonwealth of Independent States (former USSR), launched 1993".
-//
-// There is no safe fix available in this function alone: every value in the
-// 16-bit space is now potentially a real, currently-assigned NORAD ID (global
-// catalog numbering is sequential and has already passed 100000), so there is
-// no sub-range left that's guaranteed free to use as a substitute/sentinel
-// without either (a) still risking a collision with a real object, or (b)
-// colliding overflowing satellites with EACH OTHER if they're forced to
-// share one fixed placeholder value - which would corrupt live position
-// tracking (satellites visibly jumping between each other), a worse failure
-// than the current wrong-text-in-a-panel bug. Fixing this properly means
-// widening the encoding itself, which needs a matching change wherever the
-// frontend decodes the hex back into a NORAD ID (getSatelliteNoradId() et
-// al.) - not currently in this file.
-//
-// Until then: this at least makes the problem visible and countable, rather
-// than silently wrong. The hex value itself is UNCHANGED from before.
-const CATEGORY_SPAN = 0x10000;
-const OVERFLOW_LOG_LIMIT = 20;   // avoid flooding the log if this becomes the common case
-let overflowCountThisCycle = 0;   // reset by resetOverflowCounter() at the start of each load cycle
-
-function resetOverflowCounter() {
-  overflowCountThisCycle = 0;
-}
-
-function buildHexId(category, noradId) {
-  const band = (0xF0 + (CATEGORY_BANDS[category] ?? CATEGORY_BANDS.other));
-  if (noradId >= CATEGORY_SPAN) {
-    overflowCountThisCycle++;
-    if (overflowCountThisCycle <= OVERFLOW_LOG_LIMIT) {
-      console.warn(`buildHexId: NORAD ID ${noradId} exceeds the 16-bit encoding ceiling (${CATEGORY_SPAN - 1}) - `
-        + `its fake hex will collide with whichever real, smaller NORAD ID shares the same low 16 bits `
-        + `(${noradId % CATEGORY_SPAN}). Owner/launch lookups for this satellite on the frontend will show `
-        + `that OTHER object's data, not this one's, until the encoding is widened.`
-        + (overflowCountThisCycle === OVERFLOW_LOG_LIMIT ? ' (further occurrences this cycle will be counted but not logged individually)' : ''));
-    }
-  }
-  const low = noradId % CATEGORY_SPAN;
-  return (((band << 16) | low) >>> 0).toString(16).toUpperCase().padStart(6, '0');
-}
-
 let satRecords = [];
-const clients = new Set();
-
-// Start TCP Server
-const server = net.createServer((socket) => {
-  console.log(`Ultrafeeder connected from ${socket.remoteAddress}`);
-  clients.add(socket);
-
-  socket.on('end', () => clients.delete(socket));
-  socket.on('error', () => clients.delete(socket));
-});
-
-server.listen(TCP_PORT, () => {
-  console.log(`SBS/Basestation TCP Server listening on port ${TCP_PORT}`);
-});
+// The current JSON response body, pre-serialized once per computeSatellitePositions()
+// cycle rather than per HTTP request - many simultaneous browser clients (every
+// visitor's own browser, same as the CelesTrak calls elsewhere in this project)
+// share one already-done piece of work instead of each triggering fresh SGP4
+// propagation for every satellite.
+let latestPayload = JSON.stringify({ generated_at: 0, satellites: [] });
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
@@ -218,8 +159,79 @@ function fetchWithCurl(url) {
   });
 }
 
-function processOMMData(groupResults) {
-  resetOverflowCounter();
+// CelesTrak's SATCAT uses "" for an empty field (not absent, not null) -
+// normalise that to a real null so the JSON this serves is clean to consume.
+function emptyToNull(v) {
+  return (v === '' || v === undefined) ? null : v;
+}
+
+// Merges a SATCAT record (owner, launch, physical/orbital facts - static,
+// barely ever changes) with the information-bearing fields of an OMM record
+// (epoch, mean motion, eccentricity, drag term - these describe the CURRENT
+// element set, not the satellite itself, but are genuinely useful alongside
+// it). Deliberately excludes OMM boilerplate fields that are the same for
+// every record (REF_FRAME, TIME_SYSTEM, MEAN_ELEMENT_THEORY, CENTER_NAME) -
+// those carry no information here. Computed once per satellite when its
+// records are loaded (fresh fetch or from cache), not on every position tick.
+function buildEnrichment(satcat, ommData) {
+  const out = {
+    object_id: null, object_type: null, ops_status_code: null, owner: null,
+    launch_date: null, launch_site: null, decay_date: null,
+    period_min: null, inclination_deg: null, apogee_km: null, perigee_km: null,
+    rcs_m2: null, data_status_code: null, orbit_center: null, orbit_type: null,
+  };
+  if (satcat) {
+    out.object_id = emptyToNull(satcat.OBJECT_ID);
+    out.object_type = emptyToNull(satcat.OBJECT_TYPE);
+    out.ops_status_code = emptyToNull(satcat.OPS_STATUS_CODE);
+    out.owner = emptyToNull(satcat.OWNER);
+    out.launch_date = emptyToNull(satcat.LAUNCH_DATE);
+    out.launch_site = emptyToNull(satcat.LAUNCH_SITE);
+    out.decay_date = emptyToNull(satcat.DECAY_DATE);
+    out.period_min = (typeof satcat.PERIOD === 'number') ? satcat.PERIOD : null;
+    out.inclination_deg = (typeof satcat.INCLINATION === 'number') ? satcat.INCLINATION : null;
+    out.apogee_km = (typeof satcat.APOGEE === 'number') ? satcat.APOGEE : null;
+    out.perigee_km = (typeof satcat.PERIGEE === 'number') ? satcat.PERIGEE : null;
+    out.rcs_m2 = (typeof satcat.RCS === 'number') ? satcat.RCS : null;
+    out.data_status_code = emptyToNull(satcat.DATA_STATUS_CODE);
+    out.orbit_center = emptyToNull(satcat.ORBIT_CENTER);
+    out.orbit_type = emptyToNull(satcat.ORBIT_TYPE);
+  }
+  out.epoch = (ommData && ommData.EPOCH) || null;
+  out.mean_motion_rev_per_day = (ommData && typeof ommData.MEAN_MOTION === 'number') ? ommData.MEAN_MOTION : null;
+  out.eccentricity = (ommData && typeof ommData.ECCENTRICITY === 'number') ? ommData.ECCENTRICITY : null;
+  out.bstar = (ommData && typeof ommData.BSTAR === 'number') ? ommData.BSTAR : null;
+  out.element_set_no = (ommData && typeof ommData.ELEMENT_SET_NO === 'number') ? ommData.ELEMENT_SET_NO : null;
+  out.rev_at_epoch = (ommData && typeof ommData.REV_AT_EPOCH === 'number') ? ommData.REV_AT_EPOCH : null;
+  return out;
+}
+
+function processOMMData(groupResults, satcatGroupResults) {
+  // One NORAD ID -> SATCAT record lookup built across every fetched group,
+  // so it doesn't matter which specific group a satellite's OMM data came
+  // from - a satellite appearing in two groups' SATCAT results just keeps
+  // whichever copy was seen first (they should be identical anyway).
+  const satcatByNoradId = new Map();
+  let satcatParsed = 0;
+  for (let g = 0; g < (satcatGroupResults || []).length; g++) {
+    const rawData = satcatGroupResults[g];
+    if (!rawData) continue;
+    let records;
+    try {
+      records = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    } catch (e) {
+      console.error(`Error parsing SATCAT JSON for group ${CELESTRAK_GROUPS[g]}:`, e.message);
+      continue;
+    }
+    if (!Array.isArray(records)) continue;
+    satcatParsed += records.length;
+    for (const rec of records) {
+      if (rec && rec.NORAD_CAT_ID != null && !satcatByNoradId.has(rec.NORAD_CAT_ID)) {
+        satcatByNoradId.set(rec.NORAD_CAT_ID, rec);
+      }
+    }
+  }
+
   const newSatRecords = [];
   const seenNoradIds = new Set();
   const categoryCounts = {};
@@ -249,13 +261,20 @@ function processOMMData(groupResults) {
           seenNoradIds.add(satrec.satnum);
           categoryCounts[category] = (categoryCounts[category] || 0) + 1;
           const name = omm.OBJECT_NAME || 'SAT';
+          const satcat = satcatByNoradId.get(satrec.satnum) || null;
           newSatRecords.push({
-            name: name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8),
+            // Full name, untruncated - the 8-char alphanumeric-only strip
+            // this used to have (name.replace(...).substring(0,8)) existed
+            // only to fit inside an SBS MSG,1 callsign field. There's no
+            // such constraint on a JSON field: "ISS (ZARYA)" now really
+            // does read "ISS (ZARYA)", not "ISSZARYA".
+            name: name,
             noradId: satrec.satnum,
             satrec: satrec,
             category: category,
-            hexId: buildHexId(category, satrec.satnum),
-            ommData: omm
+            ommData: omm,
+            satcat: satcat,
+            enrichment: buildEnrichment(satcat, omm),
           });
         }
       } catch (e) {
@@ -270,12 +289,9 @@ function processOMMData(groupResults) {
   if (newSatRecords.length > 0) {
     satRecords = newSatRecords;
     const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
+    const matched = newSatRecords.filter(s => s.satcat).length;
     console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
-    if (overflowCountThisCycle > 0) {
-      console.warn(`${overflowCountThisCycle} of those ${satRecords.length} satellites have a NORAD ID that does not fit `
-        + `the current 16-bit hex encoding (see buildHexId()'s comment) - their owner/launch info on the frontend will `
-        + `be for a different, real satellite, not themselves, until the encoding is widened.`);
-    }
+    console.log(`SATCAT enrichment: ${matched}/${satRecords.length} satellites matched (${satcatParsed} SATCAT records fetched across ${(satcatGroupResults || []).length} groups)`);
     return true;
   }
   return false;
@@ -305,8 +321,9 @@ function loadFromCache() {
             noradId: item.noradId,
             satrec: satrec,
             category: item.category,
-            hexId: item.hexId,
-            ommData: item.ommData
+            ommData: item.ommData,
+            satcat: item.satcat || null,
+            enrichment: buildEnrichment(item.satcat || null, item.ommData),
           });
         }
       }
@@ -337,8 +354,8 @@ function saveToCache() {
       name: s.name,
       noradId: s.noradId,
       category: s.category,
-      hexId: s.hexId,
-      ommData: s.ommData
+      ommData: s.ommData,
+      satcat: s.satcat
     }));
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cachePayload), 'utf8');
     console.log(`Saved ${satRecords.length} satellite records to local cache (${CACHE_FILE})`);
@@ -362,17 +379,25 @@ async function updateTLEs() {
 
   console.log(`Cache missing or older than ${REFRESH_HOURS} hours. Requesting updates from CelesTrak...`);
   try {
-    const results = [];
-    
+    const gpResults = [];
+    const satcatResults = [];
+
     for (const group of CELESTRAK_GROUPS) {
       if (networkingDisabled) break;
-      const url = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
-      const data = await fetchWithCurl(url);
-      results.push(data);
+      const gpUrl = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
+      gpResults.push(await fetchWithCurl(gpUrl));
+
+      if (networkingDisabled) break;   // the GP fetch above may have tripped the compliance flag
+      // Bulk SATCAT query for the SAME group - one extra request per group,
+      // not one per satellite (celestrak.org/satcat/records.php supports
+      // GROUP= exactly like the GP endpoint does). This is what supplies
+      // owner, launch date/site, object type, RCS, etc. - see buildEnrichment().
+      const satcatUrl = `https://celestrak.org/satcat/records.php?GROUP=${group}&FORMAT=JSON`;
+      satcatResults.push(await fetchWithCurl(satcatUrl));
     }
 
     if (!networkingDisabled) {
-      const success = processOMMData(results);
+      const success = processOMMData(gpResults, satcatResults);
       if (success) {
         saveToCache();
       } else {
@@ -404,101 +429,117 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
   return Math.round((Math.atan2(y, x) * 180 / Math.PI + 360) % 360);
 }
 
-function getSBSDateTime(dateObj) {
-  const pad = (n, w = 2) => String(n).padStart(w, '0');
-  const dStr = `${dateObj.getUTCFullYear()}/${pad(dateObj.getUTCMonth() + 1)}/${pad(dateObj.getUTCDate())}`;
-  const tStr = `${pad(dateObj.getUTCHours())}:${pad(dateObj.getUTCMinutes())}:${pad(dateObj.getUTCSeconds())}.${pad(dateObj.getUTCMilliseconds(), 3)}`;
-  return { dStr, tStr };
-}
-
-function broadcastTCP() {
-  if (!satRecords.length || clients.size === 0) return;
+// Recomputes every satellite's current position/velocity and re-serializes
+// latestPayload. Real units throughout - no scaling, no clamping to keep a
+// value "plausible" for an ADS-B field that no longer exists. Unit
+// conversions that ARE genuinely needed (km -> ft) are done here rather than
+// left to the browser, the same as processDrone() in script.js converts m/s
+// to knots before handing data to PlaneObject - the JSON this serves is
+// meant to be consumed directly, not further translated.
+function computeSatellitePositions() {
+  if (!satRecords.length) return;
 
   const now = new Date();
   const future = new Date(now.getTime() + 1000);
   const gmstNow = satellite.gstime(now);
   const gmstFuture = satellite.gstime(future);
-  const { dStr, tStr } = getSBSDateTime(now);
+  const satellites = [];
 
-  for (let sat of satRecords) {
-
+  for (const sat of satRecords) {
     try {
-    if (sat.satrec.error !== 0) continue;
+      if (sat.satrec.error !== 0) continue;
 
-    const posVelNow = satellite.propagate(sat.satrec, now);
-    if (!posVelNow || !posVelNow.position || !posVelNow.velocity) continue;
+      const posVelNow = satellite.propagate(sat.satrec, now);
+      if (!posVelNow || !posVelNow.position || !posVelNow.velocity) continue;
 
-    const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
+      const geoNow = satellite.eciToGeodetic(posVelNow.position, gmstNow);
+      if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) continue;
 
-    if (!Number.isFinite(geoNow.height) || geoNow.height < MIN_PLAUSIBLE_ALT_KM) {
-      continue;
-    }
+      const lat = satellite.degreesLat(geoNow.latitude);
+      const lon = satellite.degreesLong(geoNow.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 
-    const SAT_ALT_SCALE = 5000;
-    const rawAltFt = Math.round(geoNow.height * KM_TO_FEET);
-    const altFt = Math.round(rawAltFt / SAT_ALT_SCALE);
+      const altFt = Math.round(geoNow.height * KM_TO_FEET);
 
-    const lat = satellite.degreesLat(geoNow.latitude);
-    const lon = satellite.degreesLong(geoNow.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const { x, y, z } = posVelNow.velocity;
+      const speedKnots = Math.round(Math.sqrt(x * x + y * y + z * z) * 1943.84);
 
-    const latStr = lat.toFixed(4);
-    const lonStr = lon.toFixed(4);
+      let track = null;
+      let vrateFpm = null;
 
-    const { x, y, z } = posVelNow.velocity;
-    const speedKnots = Math.round(Math.sqrt(x * x + y * y + z * z) * 1943.84);
-
-    const posVelFuture = satellite.propagate(sat.satrec, future);
-    let track = '';
-    let vRate = '';
-    
-    if (posVelFuture && posVelFuture.position && posVelFuture.velocity) {
-      const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
-      
-      if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
-        const rawAltFtFuture = Math.round(geoFuture.height * KM_TO_FEET);
-        const futLat = satellite.degreesLat(geoFuture.latitude);
-        const futLon = satellite.degreesLong(geoFuture.longitude);
-
-        if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
-          track = calculateBearing(lat, lon, futLat, futLon);
-          let rawVRate = Math.round((rawAltFtFuture - rawAltFt) * 60);
-
-          if (geoNow.height < MIN_PLAUSIBLE_ALT_KM + 50) {
-            vRate = 0;
-          } else {
-            vRate = Math.max(-32640, Math.min(32640, rawVRate));
+      const posVelFuture = satellite.propagate(sat.satrec, future);
+      if (posVelFuture && posVelFuture.position && posVelFuture.velocity) {
+        const geoFuture = satellite.eciToGeodetic(posVelFuture.position, gmstFuture);
+        if (Number.isFinite(geoFuture.height) && geoFuture.height >= MIN_PLAUSIBLE_ALT_KM) {
+          const futLat = satellite.degreesLat(geoFuture.latitude);
+          const futLon = satellite.degreesLong(geoFuture.longitude);
+          if (Number.isFinite(futLat) && Number.isFinite(futLon)) {
+            track = calculateBearing(lat, lon, futLat, futLon);
+            const altFtFuture = Math.round(geoFuture.height * KM_TO_FEET);
+            // No clamp to +/-32640 and no "force to 0 near the ground" rule
+            // any more - those existed only to keep the SBS vertical-rate
+            // field within a range readsb would accept for an aircraft.
+            // There's no such field now; this is just the true value.
+            vrateFpm = (altFtFuture - altFt) * 60;
           }
         }
       }
-    }
 
-    const hexId = sat.hexId;
-
-    const msg1 = `MSG,1,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},${sat.name},,,,,,,,,,,0\r\n`;
-    const msg3 = `MSG,3,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,${altFt},,,${latStr},${lonStr},,,,,,0\r\n`;
-    
-    let msg4 = '';
-    if (track !== '' && vRate !== '') {
-      msg4 = `MSG,4,1,1,${hexId},1,${dStr},${tStr},${dStr},${tStr},,,${speedKnots},${track},,,${vRate},,,,,0\r\n`;
-    }
-
-    const payload = msg1 + msg3 + msg4;
-
-    for (const client of clients) {
-      if (client.writable) {
-        client.write(payload, (err) => {
-          if (err) clients.delete(client);
-        });
-      } else {
-        clients.delete(client);
-      }
-    }
+      satellites.push({
+        noradId: sat.noradId,
+        name: sat.name,
+        category: sat.category,
+        lat: Number(lat.toFixed(4)),
+        lon: Number(lon.toFixed(4)),
+        alt_ft: altFt,
+        speed_kn: speedKnots,
+        track: track,
+        vrate_fpm: vrateFpm,
+        // owner, launch date/site, object type, RCS, orbital elements, etc -
+        // precomputed once per satellite in buildEnrichment() when its
+        // records were loaded (fresh fetch or cache), not recomputed on
+        // every 2-second tick since none of it changes that often.
+        ...sat.enrichment,
+      });
     } catch (satError) {
-      console.error(`Error processing satellite ${sat.name || sat.hexId}, skipping it for this cycle:`, satError.message);
+      console.error(`Error processing satellite ${sat.name || sat.noradId}, skipping it for this cycle:`, satError.message);
     }
   }
+
+  latestPayload = JSON.stringify({ generated_at: now.getTime() / 1000, satellites: satellites });
 }
+
+// A small, read-only JSON endpoint - the frontend's "satellite URL" setting
+// points straight at this (e.g. http://your-host:SATELLITE_HTTP_PORT/), the
+// same way droneJson/aiscatcher_server are just a URL the browser polls
+// directly. Access-Control-Allow-Origin is required (not optional) here:
+// this is served on its own port, so from the browser's point of view it is
+// always a cross-origin request even when it's the same physical host - see
+// the earlier CORS investigation into adsb.lol/adsb.im in this project for
+// exactly what happens without it.
+const httpServer = http.createServer((req, res) => {
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('Method Not Allowed');
+    return;
+  }
+  const url = req.url.split('?')[0];
+  if (url !== '/' && url !== '/satellites.json') {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store',
+  });
+  res.end(latestPayload);
+});
+
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`Satellite JSON endpoint listening on port ${HTTP_PORT} (GET / or /satellites.json)`);
+});
 
 // Initial boot check
 const STARTUP_RETRY_MS = 5 * 60 * 1000; // 5 minutes - short enough to recover quickly from a boot-time race, nowhere near frequent enough to trouble CelesTrak even if it took several attempts
@@ -519,11 +560,12 @@ async function checkStartupSuccess() {
 }
 (async () => {
   await updateTLEs();
+  computeSatellitePositions();   // don't leave the endpoint serving an empty list until the first tick
   checkStartupSuccess();
 })();
 
 // Dynamic re-check interval based on TLE_REFRESH_HOURS
 setInterval(updateTLEs, CACHE_MAX_AGE_MS);
 
-// Broadcast positions every 2 seconds
-setInterval(broadcastTCP, REFRESH_INTERVAL_MS);
+// Recompute positions every 2 seconds
+setInterval(computeSatellitePositions, REFRESH_INTERVAL_MS);
