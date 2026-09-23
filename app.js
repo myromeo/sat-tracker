@@ -116,10 +116,58 @@ for (const group of CELESTRAK_GROUPS) {
   }
 }
 
+// CATEGORY_SPAN (65536) is all the room a fake ICAO hex has left for a NORAD
+// ID once a byte is spent on the "definitely not a real aircraft" marker
+// (0xF0-0xFF - a genuinely reserved/unallocated block in the real ICAO 24-bit
+// address space) plus the category nibble within it. That ceiling is now a
+// real, live problem: CelesTrak ran out of 5-digit catalog numbers on
+// 2026-07-11 (https://celestrak.org/satcat/satcat-format.php carries their
+// own banner about it) - every satellite launched since then, Starlink very
+// much included given how often it launches, gets a 6-digit NORAD ID
+// (100000+), which cannot fit in 16 bits no matter how it's packed.
+//
+// `noradId % CATEGORY_SPAN` used to be used here unconditionally, which is
+// silently WRONG for any such satellite: the wraparound can land on the
+// exact fake-hex value that a DIFFERENT, real, smaller NORAD ID also encodes
+// to - so the frontend confidently shows THAT satellite's owner, launch
+// date, etc. against this one. That's how a brand-new Starlink ended up
+// reading "Commonwealth of Independent States (former USSR), launched 1993".
+//
+// There is no safe fix available in this function alone: every value in the
+// 16-bit space is now potentially a real, currently-assigned NORAD ID (global
+// catalog numbering is sequential and has already passed 100000), so there is
+// no sub-range left that's guaranteed free to use as a substitute/sentinel
+// without either (a) still risking a collision with a real object, or (b)
+// colliding overflowing satellites with EACH OTHER if they're forced to
+// share one fixed placeholder value - which would corrupt live position
+// tracking (satellites visibly jumping between each other), a worse failure
+// than the current wrong-text-in-a-panel bug. Fixing this properly means
+// widening the encoding itself, which needs a matching change wherever the
+// frontend decodes the hex back into a NORAD ID (getSatelliteNoradId() et
+// al.) - not currently in this file.
+//
+// Until then: this at least makes the problem visible and countable, rather
+// than silently wrong. The hex value itself is UNCHANGED from before.
 const CATEGORY_SPAN = 0x10000;
+const OVERFLOW_LOG_LIMIT = 20;   // avoid flooding the log if this becomes the common case
+let overflowCountThisCycle = 0;   // reset by resetOverflowCounter() at the start of each load cycle
+
+function resetOverflowCounter() {
+  overflowCountThisCycle = 0;
+}
 
 function buildHexId(category, noradId) {
   const band = (0xF0 + (CATEGORY_BANDS[category] ?? CATEGORY_BANDS.other));
+  if (noradId >= CATEGORY_SPAN) {
+    overflowCountThisCycle++;
+    if (overflowCountThisCycle <= OVERFLOW_LOG_LIMIT) {
+      console.warn(`buildHexId: NORAD ID ${noradId} exceeds the 16-bit encoding ceiling (${CATEGORY_SPAN - 1}) - `
+        + `its fake hex will collide with whichever real, smaller NORAD ID shares the same low 16 bits `
+        + `(${noradId % CATEGORY_SPAN}). Owner/launch lookups for this satellite on the frontend will show `
+        + `that OTHER object's data, not this one's, until the encoding is widened.`
+        + (overflowCountThisCycle === OVERFLOW_LOG_LIMIT ? ' (further occurrences this cycle will be counted but not logged individually)' : ''));
+    }
+  }
   const low = noradId % CATEGORY_SPAN;
   return (((band << 16) | low) >>> 0).toString(16).toUpperCase().padStart(6, '0');
 }
@@ -171,6 +219,7 @@ function fetchWithCurl(url) {
 }
 
 function processOMMData(groupResults) {
+  resetOverflowCounter();
   const newSatRecords = [];
   const seenNoradIds = new Set();
   const categoryCounts = {};
@@ -222,6 +271,11 @@ function processOMMData(groupResults) {
     satRecords = newSatRecords;
     const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
     console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
+    if (overflowCountThisCycle > 0) {
+      console.warn(`${overflowCountThisCycle} of those ${satRecords.length} satellites have a NORAD ID that does not fit `
+        + `the current 16-bit hex encoding (see buildHexId()'s comment) - their owner/launch info on the frontend will `
+        + `be for a different, real satellite, not themselves, until the encoding is widened.`);
+    }
     return true;
   }
   return false;
