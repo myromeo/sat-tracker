@@ -7,6 +7,17 @@ const path = require('path');
 // Cache & Refresh Configuration
 const CACHE_DIR = process.env.CACHE_DIR || __dirname;
 const CACHE_FILE = path.join(CACHE_DIR, 'sat_cache.json');
+// Bump this whenever the SHAPE of what's cached changes meaningfully (a new
+// field added to what each record carries, a renamed field, etc) - not for
+// every code change. loadFromCache() rejects any cache file whose version
+// doesn't match, regardless of age, so a stale-but-recent cache from before
+// a feature existed can never silently mask that feature after a deploy.
+// This is exactly what happened once already: the SATCAT enrichment fields
+// (owner, launch date, object type, ...) were added, but a cache file
+// written by the OLD code - sitting on a persistent volume that survives
+// redeploys - was still under REFRESH_HOURS old, so it kept getting reused
+// with no enrichment data at all until it happened to age out naturally.
+const CACHE_SCHEMA_VERSION = 2;
 const DISABLED_FLAG_FILE = path.join(CACHE_DIR, 'NETWORKING_DISABLED.flag');
 const REFRESH_HOURS = parseFloat(process.env.TLE_REFRESH_HOURS) || 12;
 const CACHE_MAX_AGE_MS = REFRESH_HOURS * 60 * 60 * 1000;
@@ -226,8 +237,16 @@ function processOMMData(groupResults, satcatGroupResults) {
     if (!Array.isArray(records)) continue;
     satcatParsed += records.length;
     for (const rec of records) {
-      if (rec && rec.NORAD_CAT_ID != null && !satcatByNoradId.has(rec.NORAD_CAT_ID)) {
-        satcatByNoradId.set(rec.NORAD_CAT_ID, rec);
+      // Keyed as a STRING deliberately - satellite.js's json2satrec() stores
+      // satrec.satnum in whatever form it uses internally for SGP4 (a TLE-
+      // format heritage that doesn't guarantee a plain JS number), while
+      // CelesTrak's SATCAT JSON gives NORAD_CAT_ID as a genuine number. A Map
+      // keyed by the raw, un-normalised value from either side would silently
+      // never match the other - not a partial mismatch, a total one, since
+      // "25544" !== 25544 as Map keys even though they mean the same satellite.
+      if (rec && rec.NORAD_CAT_ID != null) {
+        const key = String(rec.NORAD_CAT_ID);
+        if (!satcatByNoradId.has(key)) satcatByNoradId.set(key, rec);
       }
     }
   }
@@ -261,7 +280,7 @@ function processOMMData(groupResults, satcatGroupResults) {
           seenNoradIds.add(satrec.satnum);
           categoryCounts[category] = (categoryCounts[category] || 0) + 1;
           const name = omm.OBJECT_NAME || 'SAT';
-          const satcat = satcatByNoradId.get(satrec.satnum) || null;
+          const satcat = satcatByNoradId.get(String(satrec.satnum)) || null;
           newSatRecords.push({
             // Full name, untruncated - the 8-char alphanumeric-only strip
             // this used to have (name.replace(...).substring(0,8)) existed
@@ -269,7 +288,13 @@ function processOMMData(groupResults, satcatGroupResults) {
             // such constraint on a JSON field: "ISS (ZARYA)" now really
             // does read "ISS (ZARYA)", not "ISSZARYA".
             name: name,
-            noradId: satrec.satnum,
+            // Number(), not satrec.satnum directly - satellite.js's internal
+            // representation isn't guaranteed to be a plain JS number (see
+            // the comment on satcatByNoradId above), but the JSON this app
+            // serves documents noradId as a number, and the frontend keys
+            // off it as one (e.g. 'SAT' + noradId) - keep that contract
+            // exact regardless of what the parsing library does internally.
+            noradId: Number(satrec.satnum),
             satrec: satrec,
             category: category,
             ommData: omm,
@@ -303,7 +328,21 @@ function loadFromCache() {
   try {
     const stats = fs.statSync(CACHE_FILE);
     const ageMs = Date.now() - stats.mtimeMs;
-    const cacheData = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+
+    // Reject anything that isn't exactly the current schema, BEFORE looking
+    // at age at all - this includes the old bare-array format (no
+    // schemaVersion field), which is what every cache file written before
+    // this versioning existed looks like. A wrong/missing version is
+    // treated as "no usable cache", not "stale cache" - same effect
+    // (loadFromCache returns false, forcing a real fetch), but for a
+    // different reason worth its own log line.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      console.log(`Cache file is missing or an outdated schema version (expected v${CACHE_SCHEMA_VERSION}) - ignoring it and fetching fresh data.`);
+      return false;
+    }
+
+    const cacheData = parsed.satellites;
 
     if (Array.isArray(cacheData) && cacheData.length > 0) {
       const newSatRecords = [];
@@ -318,7 +357,7 @@ function loadFromCache() {
           categoryCounts[item.category] = (categoryCounts[item.category] || 0) + 1;
           newSatRecords.push({
             name: item.name,
-            noradId: item.noradId,
+            noradId: Number(item.noradId),
             satrec: satrec,
             category: item.category,
             ommData: item.ommData,
@@ -357,8 +396,8 @@ function saveToCache() {
       ommData: s.ommData,
       satcat: s.satcat
     }));
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachePayload), 'utf8');
-    console.log(`Saved ${satRecords.length} satellite records to local cache (${CACHE_FILE})`);
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, satellites: cachePayload }), 'utf8');
+    console.log(`Saved ${satRecords.length} satellite records to local cache (${CACHE_FILE}, schema v${CACHE_SCHEMA_VERSION})`);
   } catch (err) {
     console.error('Failed to write local cache file:', err.message);
   }
