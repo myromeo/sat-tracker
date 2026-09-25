@@ -556,14 +556,100 @@ function computeSatellitePositions() {
 // always a cross-origin request even when it's the same physical host - see
 // the earlier CORS investigation into adsb.lol/adsb.im in this project for
 // exactly what happens without it.
+// A satellite's track is fully determined by its own orbital elements - no
+// polling or storage needed at all, unlike vessels/aircraft, whose past
+// positions are inherently unpredictable and have to be recorded as they
+// happen. This just re-runs the same SGP4 propagation computeSatellitePositions()
+// already does for "now", stepping backward in time instead. Computed fresh
+// per request (cheap - a few hundred propagate() calls at most), not on a
+// timer: track requests only happen when someone actually selects a
+// satellite, nowhere near often enough to justify precomputing this for
+// the whole catalog continuously.
+const TRACK_ABSOLUTE_MAX_MINUTES = 200;   // hard ceiling regardless of the satellite's own orbital period
+const TRACK_STEP_SECONDS = 60;            // one point per minute of track
+
+function computeSatelliteTrack(noradId) {
+  const sat = satRecords.find(s => s.noradId === noradId);
+  if (!sat || !sat.satrec || sat.satrec.error !== 0) {
+    return { noradId: noradId, period_min: null, track_min: null, points: [] };
+  }
+
+  // Orbital period from the TLE's own mean motion (revs/day) - 1440 minutes
+  // in a day / revs per day = minutes per rev. A missing or non-positive
+  // mean motion (shouldn't happen for a satellite that's already propagating
+  // successfully, but never trust a single field blindly) falls back to a
+  // reasonable LEO-typical value rather than producing an absurd or
+  // negative track length.
+  const meanMotion = (sat.ommData && typeof sat.ommData.MEAN_MOTION === 'number' && sat.ommData.MEAN_MOTION > 0)
+    ? sat.ommData.MEAN_MOTION : null;
+  const periodMinutes = meanMotion ? (1440 / meanMotion) : 100;
+  const trackMinutes = Math.min(periodMinutes, TRACK_ABSOLUTE_MAX_MINUTES);
+
+  const now = Date.now();
+  const points = [];   // newest (now) first, oldest last - same convention as the vessel track API, which the frontend already reverses before drawing
+
+  for (let t = 0; t <= trackMinutes * 60; t += TRACK_STEP_SECONDS) {
+    const when = new Date(now - t * 1000);
+    try {
+      const posVel = satellite.propagate(sat.satrec, when);
+      if (!posVel || !posVel.position) continue;
+      const gmst = satellite.gstime(when);
+      const geo = satellite.eciToGeodetic(posVel.position, gmst);
+      if (!Number.isFinite(geo.height) || geo.height < MIN_PLAUSIBLE_ALT_KM) continue;
+      const lat = satellite.degreesLat(geo.latitude);
+      const lon = satellite.degreesLong(geo.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      points.push([Number(lat.toFixed(4)), Number(lon.toFixed(4)), Math.round(when.getTime() / 1000)]);
+    } catch (e) {
+      continue;   // one bad point along the track shouldn't drop the rest of it
+    }
+  }
+
+  return {
+    noradId: noradId,
+    period_min: Number(periodMinutes.toFixed(2)),
+    track_min: Number(trackMinutes.toFixed(2)),
+    points: points,
+  };
+}
+
 const httpServer = http.createServer((req, res) => {
   if (req.method !== 'GET') {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
     res.end('Method Not Allowed');
     return;
   }
-  const url = req.url.split('?')[0];
-  if (url !== '/' && url !== '/satellites.json') {
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, 'http://localhost');
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request');
+    return;
+  }
+
+  if (parsedUrl.pathname === '/satellite-track' || parsedUrl.pathname === '/satellite-track/') {
+    const noradIdParam = parsedUrl.searchParams.get('noradId');
+    const noradId = Number(noradIdParam);
+    if (!noradIdParam || !Number.isFinite(noradId)) {
+      res.writeHead(400, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({ error: 'noradId query parameter is required and must be numeric' }));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify(computeSatelliteTrack(noradId)));
+    return;
+  }
+
+  if (parsedUrl.pathname !== '/' && parsedUrl.pathname !== '/satellites.json') {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
     return;
