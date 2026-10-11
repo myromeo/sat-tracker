@@ -208,6 +208,7 @@ let latestSatellites = [];
 // and an identical reload (e.g. a container restart) keeps the same version,
 // so browsers / Cloudflare keep using their cached copy.
 let detailsVersion = null;
+let lastComputedAt = 0;   // see ensureFreshPositions()
 let latestDetailsPayload = JSON.stringify({ version: null, satellites: {} });
 
 function rebuildDetailsPayload() {
@@ -223,6 +224,7 @@ function rebuildDetailsPayload() {
 function setSatRecords(records) {
   satRecords = records;
   rebuildDetailsPayload();
+  lastComputedAt = 0;   // new elements: the next request recomputes positions straight away
 }
 
 function fetchWithCurl(url) {
@@ -631,8 +633,17 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
 // left to the browser, the same as processDrone() in script.js converts m/s
 // to knots before handing data to PlaneObject - the JSON this serves is
 // meant to be consumed directly, not further translated.
+// Positions are computed on demand: at most once per REFRESH_INTERVAL_MS, and
+// only when someone actually requests them. With nobody viewing the map the
+// feeder does no SGP4 work at all; with many viewers they all share one
+// computation per interval, exactly as before.
+function ensureFreshPositions() {
+  if (Date.now() - lastComputedAt >= REFRESH_INTERVAL_MS) computeSatellitePositions();
+}
+
 function computeSatellitePositions() {
   if (!satRecords.length) return;
+  lastComputedAt = Date.now();
 
   const now = new Date();
   const future = new Date(now.getTime() + 1000);
@@ -856,6 +867,7 @@ const httpServer = http.createServer((req, res) => {
 
   // Legacy form for anything still expecting details inline in every record:
   // /satellites.json?full=1. Built on demand - the map itself never asks for it.
+  ensureFreshPositions();
   if (parsedUrl.searchParams.get('full') === '1') {
     const byId = new Map(satRecords.map(s => [s.noradId, s.enrichment]));
     const full = latestSatellites.map(p => Object.assign({}, p, byId.get(p.noradId) || {}));
@@ -917,5 +929,4 @@ async function checkStartupSuccess() {
 // Dynamic re-check interval based on TLE_REFRESH_HOURS
 setInterval(updateTLEs, CACHE_MAX_AGE_MS);
 
-// Recompute positions every 2 seconds
-setInterval(computeSatellitePositions, REFRESH_INTERVAL_MS);
+// (No fixed 2-second timer any more: see ensureFreshPositions().)
