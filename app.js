@@ -215,6 +215,48 @@ function emptyToNull(v) {
 // every record (REF_FRAME, TIME_SYSTEM, MEAN_ELEMENT_THEORY, CENTER_NAME) -
 // those carry no information here. Computed once per satellite when its
 // records are loaded (fresh fetch or from cache), not on every position tick.
+// Earth gravitational parameter and equatorial radius (WGS-72, as SGP4 uses).
+const MU_KM3_S2 = 398600.8;
+const EARTH_RADIUS_KM = 6378.135;
+
+// Apogee / perigee / period / inclination from an OMM element set. Mean
+// elements, so good to a few km - plenty for a summary line.
+function orbitShapeFromOmm(omm) {
+  if (!omm) return null;
+  const mm = omm.MEAN_MOTION, e = omm.ECCENTRICITY, inc = omm.INCLINATION;
+  if (typeof mm !== 'number' || !(mm > 0) || typeof e !== 'number' || e < 0 || e >= 1) return null;
+  const n = mm * 2 * Math.PI / 86400;                 // rad/s
+  const a = Math.cbrt(MU_KM3_S2 / (n * n));           // semi-major axis, km
+  return {
+    period_min: Math.round(14400 / mm) / 10,          // 1440 / mm, to 0.1 min
+    inclination_deg: (typeof inc === 'number') ? Math.round(inc * 100) / 100 : null,
+    apogee_km: Math.round(a * (1 + e) - EARTH_RADIUS_KM),
+    perigee_km: Math.round(a * (1 - e) - EARTH_RADIUS_KM),
+    eccentricity: e,
+  };
+}
+
+// Orbit class from the whole orbit, not the current altitude, so an
+// elliptical orbit (Molniya, GTO) keeps one label all the way round.
+//   LEO  apogee < 2,000 km
+//   GEO  ~1 sidereal day period, near-circular, inclination < 3 deg (geostationary)
+//   GSO  ~1 sidereal day period, near-circular, inclined (geosynchronous)
+//   HEO  highly elliptical (e >= 0.25)
+//   MEO  between LEO and GEO
+//   HIGH near-circular above GEO
+function classifyOrbit(apogeeKm, perigeeKm, periodMin, inclinationDeg, eccentricity) {
+  if (typeof apogeeKm !== 'number' || typeof perigeeKm !== 'number') return null;
+  const e = (typeof eccentricity === 'number') ? eccentricity
+    : (apogeeKm - perigeeKm) / (apogeeKm + perigeeKm + 2 * EARTH_RADIUS_KM);
+  if (apogeeKm < 2000) return 'LEO';
+  if (e >= 0.25) return 'HEO';
+  if (typeof periodMin === 'number' && periodMin > 1400 && periodMin < 1480 && e < 0.05) {
+    return (typeof inclinationDeg === 'number' && inclinationDeg < 3) ? 'GEO' : 'GSO';
+  }
+  if (perigeeKm > 36500) return 'HIGH';
+  return 'MEO';
+}
+
 function buildEnrichment(satcat, ommData) {
   const out = {
     object_id: null, object_type: null, ops_status_code: null, owner: null,
@@ -239,6 +281,22 @@ function buildEnrichment(satcat, ommData) {
     out.orbit_center = emptyToNull(satcat.ORBIT_CENTER);
     out.orbit_type = emptyToNull(satcat.ORBIT_TYPE);
   }
+  // Orbit shape from the CURRENT element set where there is one: SATCAT's
+  // APOGEE/PERIGEE/PERIOD/INCLINATION are only updated occasionally and can
+  // be months out of date, while the OMM elements are what the map is
+  // actually propagating. SATCAT values stay as the fallback.
+  const shape = orbitShapeFromOmm(ommData);
+  if (shape) {
+    out.period_min = shape.period_min;
+    out.inclination_deg = shape.inclination_deg;
+    out.apogee_km = shape.apogee_km;
+    out.perigee_km = shape.perigee_km;
+  }
+  out.orbit_class = classifyOrbit(out.apogee_km, out.perigee_km, out.period_min, out.inclination_deg,
+    shape ? shape.eccentricity : null);
+  // SATCAT ORBIT_TYPE "DOC" = docked to another catalogued object (e.g. a
+  // crew or cargo vehicle at the ISS) - explains co-located icons on the map.
+  out.docked = out.orbit_type === 'DOC';
   out.epoch = (ommData && ommData.EPOCH) || null;
   out.mean_motion_rev_per_day = (ommData && typeof ommData.MEAN_MOTION === 'number') ? ommData.MEAN_MOTION : null;
   out.eccentricity = (ommData && typeof ommData.ECCENTRICITY === 'number') ? ommData.ECCENTRICITY : null;
