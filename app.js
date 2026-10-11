@@ -31,19 +31,73 @@ process.on('unhandledRejection', (err) => {
   console.error('[UNHANDLED REJECTION - continuing, not crashing]', err);
 });
 
-let networkingDisabled = fs.existsSync(DISABLED_FLAG_FILE);
-if (networkingDisabled) {
-  console.error(`[CRITICAL CELESTRAK COMPLIANCE ALERT] ${DISABLED_FLAG_FILE} is present from a previous run - `
-    + 'networking stays disabled until a human investigates and deletes this file. '
-    + 'Content of that file: ' + (() => { try { return fs.readFileSync(DISABLED_FLAG_FILE, 'utf8'); } catch (e) { return '(unreadable)'; } })());
+// CelesTrak compliance hold. Any non-200 HTTP response from CelesTrak stops
+// ALL outbound requests for NETWORK_HOLD_HOURS (default 24), then exactly one
+// fresh attempt is made: success clears the hold, another HTTP error starts a
+// new hold. So a CelesTrak outage (e.g. a 500) costs at most one request per
+// day, and the feeder recovers on its own instead of serving ever-older
+// elements until someone notices. The flag file persists the hold across
+// restarts, so restarting the container can never shortcut it.
+// Deleting the flag file by hand still lifts the hold at the next restart.
+const NETWORK_HOLD_MS = (parseFloat(process.env.NETWORK_HOLD_HOURS) || 24) * 60 * 60 * 1000;
+let holdStartedAt = 0;          // ms; 0 = no hold on record
+let holdResumeTimer = null;
+
+function readHoldStart() {
+  if (!fs.existsSync(DISABLED_FLAG_FILE)) return 0;
+  try {
+    const first = fs.readFileSync(DISABLED_FLAG_FILE, 'utf8').split('\n')[0].trim();
+    const t = Date.parse(first);
+    if (Number.isFinite(t)) return t;
+    return fs.statSync(DISABLED_FLAG_FILE).mtimeMs;   // older/odd flag file: fall back to its age
+  } catch (e) {
+    return Date.now();                                  // unreadable: be conservative, start a full hold now
+  }
 }
 
-function disableNetworkingPermanently(reason) {
-  networkingDisabled = true;
+function holdUntil() { return holdStartedAt ? holdStartedAt + NETWORK_HOLD_MS : 0; }
+function networkHoldActive() { return holdStartedAt > 0 && Date.now() < holdUntil(); }
+
+// Run an update as soon as the hold ends, rather than waiting for the next
+// regular refresh interval.
+function scheduleHoldResume() {
+  if (holdResumeTimer) clearTimeout(holdResumeTimer);
+  const wait = holdUntil() - Date.now();
+  if (wait <= 0) return;
+  holdResumeTimer = setTimeout(() => {
+    holdResumeTimer = null;
+    console.log('CelesTrak hold period over - making one fresh attempt.');
+    updateTLEs();
+  }, wait + 5000);
+}
+
+function startNetworkHold(reason) {
+  holdStartedAt = Date.now();
   try {
-    fs.writeFileSync(DISABLED_FLAG_FILE, `${new Date().toISOString()}\n${reason}\n`, 'utf8');
+    fs.writeFileSync(DISABLED_FLAG_FILE,
+      `${new Date(holdStartedAt).toISOString()}\n${reason}\nHold until ${new Date(holdUntil()).toISOString()}, then one retry.\n`, 'utf8');
   } catch (err) {
-    console.error('Failed to write networking-disabled flag file (networking is still disabled in-memory for this run):', err.message);
+    console.error('Failed to write the hold flag file (the hold still applies in memory for this run):', err.message);
+  }
+  console.error(`[CELESTRAK COMPLIANCE HOLD] ${reason} All CelesTrak requests paused until ${new Date(holdUntil()).toISOString()}; serving cached data meanwhile.`);
+  scheduleHoldResume();
+}
+
+function clearNetworkHold() {
+  if (!holdStartedAt && !fs.existsSync(DISABLED_FLAG_FILE)) return;
+  holdStartedAt = 0;
+  try { fs.unlinkSync(DISABLED_FLAG_FILE); } catch (e) { /* already gone */ }
+  console.log('CelesTrak fetch succeeded after a hold - hold cleared, normal refresh schedule resumed.');
+}
+
+holdStartedAt = readHoldStart();
+if (holdStartedAt) {
+  if (networkHoldActive()) {
+    console.warn(`[CELESTRAK COMPLIANCE HOLD] Hold from a previous run (started ${new Date(holdStartedAt).toISOString()}) - `
+      + `no CelesTrak requests until ${new Date(holdUntil()).toISOString()}; serving cached data meanwhile.`);
+    scheduleHoldResume();
+  } else {
+    console.log(`Previous CelesTrak hold (started ${new Date(holdStartedAt).toISOString()}) has expired - one fresh attempt will be made.`);
   }
 }
 
@@ -192,7 +246,7 @@ function fetchWithCurl(url) {
         return reject({
           isHttpError: true,
           status: httpCode,
-          message: `CelesTrak returned non-200 HTTP response code: [${httpCode}]. Querying stopped per compliance rules.`
+          message: `CelesTrak returned HTTP ${httpCode} for ${url.replace(/^https:\/\/celestrak\.org/, '')}.`
         });
       }
 
@@ -492,9 +546,23 @@ function saveToCache() {
   }
 }
 
+let updateInProgress = false;
+
 async function updateTLEs() {
-  if (networkingDisabled) {
-    console.warn('Network requests disabled due to previous CelesTrak HTTP error. Operating purely from cache.');
+  // single-flight: the hold-resume timer, the regular interval and the
+  // startup retry can otherwise overlap
+  if (updateInProgress) return;
+  updateInProgress = true;
+  try {
+    await updateTLEsInner();
+  } finally {
+    updateInProgress = false;
+  }
+}
+
+async function updateTLEsInner() {
+  if (networkHoldActive()) {
+    console.warn(`CelesTrak requests on hold until ${new Date(holdUntil()).toISOString()} after an HTTP error. Serving cached data.`);
     loadFromCache();
     return;
   }
@@ -511,11 +579,11 @@ async function updateTLEs() {
     const satcatResults = [];
 
     for (const group of CELESTRAK_GROUPS) {
-      if (networkingDisabled) break;
+      if (networkHoldActive()) break;
       const gpUrl = `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=json`;
       gpResults.push(await fetchWithCurl(gpUrl));
 
-      if (networkingDisabled) break;   // the GP fetch above may have tripped the compliance flag
+      if (networkHoldActive()) break;   // the GP fetch above may have started a hold
       // Bulk SATCAT query for the SAME group - one extra request per group,
       // not one per satellite (celestrak.org/satcat/records.php supports
       // GROUP= exactly like the GP endpoint does). This is what supplies
@@ -524,10 +592,11 @@ async function updateTLEs() {
       satcatResults.push(await fetchWithCurl(satcatUrl));
     }
 
-    if (!networkingDisabled) {
+    if (!networkHoldActive()) {
       const success = processOMMData(gpResults, satcatResults);
       if (success) {
         saveToCache();
+        clearNetworkHold();
       } else {
         console.warn('Network response contained no valid satellite records. Reverting to cache fallback.');
         loadFromCache();
@@ -535,9 +604,7 @@ async function updateTLEs() {
     }
   } catch (err) {
     if (err.isHttpError) {
-      console.error(`[CRITICAL CELESTRAK COMPLIANCE ALERT] ${err.message}`);
-      console.error('Ceasing all outward network queries immediately to avoid IP ban. Please investigate human-side.');
-      disableNetworkingPermanently(err.message);
+      startNetworkHold(err.message);
     } else {
       console.error('TLE fetch network error:', err.message);
     }
@@ -828,8 +895,8 @@ httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
 const STARTUP_RETRY_MS = 5 * 60 * 1000; // 5 minutes - short enough to recover quickly from a boot-time race, nowhere near frequent enough to trouble CelesTrak even if it took several attempts
 
 async function checkStartupSuccess() {
-  if (networkingDisabled) {
-    return; // hard stop, by design - no retry, human intervention required
+  if (networkHoldActive()) {
+    return; // the hold-resume timer makes the next attempt
   }
   if (satRecords.length > 0) {
     console.log('Initial satellite load succeeded - startup retry loop no longer needed.');
