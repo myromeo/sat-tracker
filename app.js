@@ -3,6 +3,8 @@ const satellite = require('satellite.js');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
+const crypto = require('crypto');
 
 // Cache & Refresh Configuration
 const CACHE_DIR = process.env.CACHE_DIR || __dirname;
@@ -138,7 +140,36 @@ let satRecords = [];
 // visitor's own browser, same as the CelesTrak calls elsewhere in this project)
 // share one already-done piece of work instead of each triggering fresh SGP4
 // propagation for every satellite.
-let latestPayload = JSON.stringify({ generated_at: 0, satellites: [] });
+let latestPayload = JSON.stringify({ generated_at: 0, details_version: null, satellites: [] });
+// The positions themselves (not yet serialised), kept only so the legacy
+// "?full=1" form of the positions endpoint can merge the details back in.
+let latestSatellites = [];
+
+// Catalogue details (owner, launch, object type, RCS, orbital elements, ...)
+// are served separately from positions: they only change when satRecords is
+// reloaded (TLE refresh / cache load), so sending them in every 2-second
+// positions payload just multiplied the download size. detailsVersion is a
+// short content hash of the details payload - it goes out with every
+// positions payload, so the browser re-fetches details only when it changes,
+// and an identical reload (e.g. a container restart) keeps the same version,
+// so browsers / Cloudflare keep using their cached copy.
+let detailsVersion = null;
+let latestDetailsPayload = JSON.stringify({ version: null, satellites: {} });
+
+function rebuildDetailsPayload() {
+  const byId = {};
+  for (const s of satRecords) byId[s.noradId] = s.enrichment;
+  const body = JSON.stringify(byId);
+  detailsVersion = crypto.createHash('sha1').update(body).digest('hex').slice(0, 12);
+  latestDetailsPayload = '{"version":' + JSON.stringify(detailsVersion) + ',"satellites":' + body + '}';
+  console.log(`Satellite details payload rebuilt: ${satRecords.length} satellites, version ${detailsVersion}, ${latestDetailsPayload.length} bytes`);
+}
+
+// Single place satRecords is replaced, so the details payload always matches it.
+function setSatRecords(records) {
+  satRecords = records;
+  rebuildDetailsPayload();
+}
 
 function fetchWithCurl(url) {
   return new Promise((resolve, reject) => {
@@ -312,7 +343,7 @@ function processOMMData(groupResults, satcatGroupResults) {
   }
 
   if (newSatRecords.length > 0) {
-    satRecords = newSatRecords;
+    setSatRecords(newSatRecords);
     const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
     const matched = newSatRecords.filter(s => s.satcat).length;
     console.log(`Loaded ${satRecords.length} unique satellites across groups: ${CELESTRAK_GROUPS.join(', ')} (${summary})`);
@@ -368,7 +399,7 @@ function loadFromCache() {
       }
 
       if (newSatRecords.length > 0) {
-        satRecords = newSatRecords;
+        setSatRecords(newSatRecords);
         const summary = Object.entries(categoryCounts).map(([c, n]) => `${c}=${n}`).join(', ');
         const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(2);
         
@@ -534,18 +565,17 @@ function computeSatellitePositions() {
         speed_kn: speedKnots,
         track: track,
         vrate_fpm: vrateFpm,
-        // owner, launch date/site, object type, RCS, orbital elements, etc -
-        // precomputed once per satellite in buildEnrichment() when its
-        // records were loaded (fresh fetch or cache), not recomputed on
-        // every 2-second tick since none of it changes that often.
-        ...sat.enrichment,
+        // Catalogue details (owner, launch, object type, RCS, orbital
+        // elements) are NOT repeated here any more - they're served once from
+        // /satellite-details, versioned by details_version below.
       });
     } catch (satError) {
       console.error(`Error processing satellite ${sat.name || sat.noradId}, skipping it for this cycle:`, satError.message);
     }
   }
 
-  latestPayload = JSON.stringify({ generated_at: now.getTime() / 1000, satellites: satellites });
+  latestSatellites = satellites;
+  latestPayload = JSON.stringify({ generated_at: now.getTime() / 1000, details_version: detailsVersion, satellites: satellites });
 }
 
 // A small, read-only JSON endpoint - the frontend's "satellite URL" setting
@@ -613,6 +643,32 @@ function computeSatelliteTrack(noradId) {
   };
 }
 
+// gzip responses when the client accepts it. Each payload is compressed at
+// most once per change (cached against the exact body string), not per request.
+const gzipCache = new Map();   // name -> { body, gz }
+function sendJson(req, res, body, cacheControl, cacheName, extraHeaders) {
+  const headers = Object.assign({
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': cacheControl,
+    'Vary': 'Accept-Encoding',
+  }, extraHeaders || {});
+  const acceptsGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  if (acceptsGzip && body.length > 1024) {
+    let entry = cacheName ? gzipCache.get(cacheName) : null;
+    if (!entry || entry.body !== body) {
+      entry = { body: body, gz: zlib.gzipSync(body) };
+      if (cacheName) gzipCache.set(cacheName, entry);
+    }
+    headers['Content-Encoding'] = 'gzip';
+    res.writeHead(200, headers);
+    res.end(entry.gz);
+    return;
+  }
+  res.writeHead(200, headers);
+  res.end(body);
+}
+
 const httpServer = http.createServer((req, res) => {
   if (req.method !== 'GET') {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
@@ -649,17 +705,41 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // Catalogue details for every loaded satellite, keyed by NORAD ID.
+  // Requested as /satellite-details?v=<details_version>: when v matches the
+  // current version the response never changes, so it may be cached for a
+  // day (a new version is a new URL). Anything else is served uncached.
+  if (parsedUrl.pathname === '/satellite-details' || parsedUrl.pathname === '/satellite-details/') {
+    const etag = '"' + detailsVersion + '"';
+    if (detailsVersion && req.headers['if-none-match'] === etag) {
+      res.writeHead(304, { 'ETag': etag, 'Access-Control-Allow-Origin': '*' });
+      res.end();
+      return;
+    }
+    const versionMatches = detailsVersion && parsedUrl.searchParams.get('v') === detailsVersion;
+    sendJson(req, res, latestDetailsPayload,
+      versionMatches ? 'public, max-age=86400, immutable' : 'no-cache',
+      'details', detailsVersion ? { 'ETag': etag } : null);
+    return;
+  }
+
   if (parsedUrl.pathname !== '/' && parsedUrl.pathname !== '/satellites.json') {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
     return;
   }
-  res.writeHead(200, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Cache-Control': 'no-store',
-  });
-  res.end(latestPayload);
+
+  // Legacy form for anything still expecting details inline in every record:
+  // /satellites.json?full=1. Built on demand - the map itself never asks for it.
+  if (parsedUrl.searchParams.get('full') === '1') {
+    const byId = new Map(satRecords.map(s => [s.noradId, s.enrichment]));
+    const full = latestSatellites.map(p => Object.assign({}, p, byId.get(p.noradId) || {}));
+    const generatedAt = (() => { try { return JSON.parse(latestPayload).generated_at; } catch (e) { return null; } })();
+    sendJson(req, res, JSON.stringify({ generated_at: generatedAt, satellites: full }), 'no-store', null);
+    return;
+  }
+
+  sendJson(req, res, latestPayload, 'no-store', 'positions');
 });
 
 // Explicit 0.0.0.0 bind - deliberately NOT relying on Node's "no host given"
@@ -683,7 +763,7 @@ httpServer.on('error', (err) => {
 });
 
 httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`Satellite JSON endpoint listening on 0.0.0.0:${HTTP_PORT} (GET / or /satellites.json)`);
+  console.log(`Satellite JSON endpoint listening on 0.0.0.0:${HTTP_PORT} (GET / or /satellites.json for positions, /satellite-details for catalogue details, /satellite-track?noradId= for orbit tracks)`);
 });
 
 // Initial boot check
